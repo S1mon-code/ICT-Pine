@@ -426,83 +426,88 @@ if not na(piv_l_val)
 // Cluster the most recent N pivots within tolerance.  We rebuild on each new pivot.
 f_rebuild_eq_clusters() =>
     // delete prior
-    for i = 0 to eq_clusters.size() - 1
-        ec = eq_clusters.get(i)
-        if not na(ec.ln)
-            line.delete(ec.ln)
-        if not na(ec.lb)
-            label.delete(ec.lb)
+    if eq_clusters.size() > 0
+        for i = 0 to eq_clusters.size() - 1
+            ec = eq_clusters.get(i)
+            if not na(ec.ln)
+                line.delete(ec.ln)
+            if not na(ec.lb)
+                label.delete(ec.lb)
     eq_clusters.clear()
     if na(atr_v) or atr_v <= 0
         eq_clusters
     else
         tol = eq_tol_atr * atr_v
         // Lows
-        used_l = array.new_bool(swings_l.size(), false)
-        for i = 0 to swings_l.size() - 1
-            if used_l.get(i)
-                continue
-            anchor = swings_l.get(i)
-            cluster_idxs = array.new_int()
-            cluster_idxs.push(i)
-            for j = i + 1 to swings_l.size() - 1
-                if used_l.get(j)
+        if swings_l.size() > 0
+            used_l = array.new_bool(swings_l.size(), false)
+            for i = 0 to swings_l.size() - 1
+                if used_l.get(i)
                     continue
-                other = swings_l.get(j)
-                if math.abs(other.price - anchor.price) <= tol
-                    cluster_idxs.push(j)
-            if cluster_idxs.size() >= eq_min_touch
-                lvl = 0.0
-                most_recent = 0
-                for k = 0 to cluster_idxs.size() - 1
-                    p = swings_l.get(cluster_idxs.get(k))
-                    lvl += p.price
-                    most_recent := math.max(most_recent, p.idx)
-                    used_l.set(cluster_idxs.get(k), true)
-                lvl /= cluster_idxs.size()
-                first_idx = swings_l.get(cluster_idxs.get(0)).idx
-                ln = show_eq ? line.new(first_idx, lvl, bar_index + 5, lvl,
-                    color=color.new(color.fuchsia, 30),
-                    style=line.style_dashed, width=2) : na
-                lb = show_eq ? label.new(bar_index + 5, lvl,
-                    text="EQL×" + str.tostring(cluster_idxs.size()),
-                    style=label.style_label_left, size=size.small,
-                    color=color.new(color.fuchsia, 70),
-                    textcolor=color.fuchsia) : na
-                eq_clusters.push(EQCluster.new(-1, lvl, cluster_idxs.size(), most_recent, ln, lb))
+                anchor = swings_l.get(i)
+                cluster_idxs = array.new_int()
+                cluster_idxs.push(i)
+                if i + 1 <= swings_l.size() - 1
+                    for j = i + 1 to swings_l.size() - 1
+                        if used_l.get(j)
+                            continue
+                        other = swings_l.get(j)
+                        if math.abs(other.price - anchor.price) <= tol
+                            cluster_idxs.push(j)
+                if cluster_idxs.size() >= eq_min_touch
+                    lvl = 0.0
+                    most_recent = 0
+                    for k = 0 to cluster_idxs.size() - 1
+                        p = swings_l.get(cluster_idxs.get(k))
+                        lvl += p.price
+                        most_recent := math.max(most_recent, p.idx)
+                        used_l.set(cluster_idxs.get(k), true)
+                    lvl /= cluster_idxs.size()
+                    first_idx = swings_l.get(cluster_idxs.get(0)).idx
+                    ln = show_eq ? line.new(first_idx, lvl, bar_index + 5, lvl,
+                        color=color.new(color.fuchsia, 30),
+                        style=line.style_dashed, width=2) : na
+                    lb = show_eq ? label.new(bar_index + 5, lvl,
+                        text="EQL×" + str.tostring(cluster_idxs.size()),
+                        style=label.style_label_left, size=size.small,
+                        color=color.new(color.fuchsia, 70),
+                        textcolor=color.fuchsia) : na
+                    eq_clusters.push(EQCluster.new(-1, lvl, cluster_idxs.size(), most_recent, ln, lb))
         // Highs
-        used_h = array.new_bool(swings_h.size(), false)
-        for i = 0 to swings_h.size() - 1
-            if used_h.get(i)
-                continue
-            anchor = swings_h.get(i)
-            cluster_idxs = array.new_int()
-            cluster_idxs.push(i)
-            for j = i + 1 to swings_h.size() - 1
-                if used_h.get(j)
+        if swings_h.size() > 0
+            used_h = array.new_bool(swings_h.size(), false)
+            for i = 0 to swings_h.size() - 1
+                if used_h.get(i)
                     continue
-                other = swings_h.get(j)
-                if math.abs(other.price - anchor.price) <= tol
-                    cluster_idxs.push(j)
-            if cluster_idxs.size() >= eq_min_touch
-                lvl = 0.0
-                most_recent = 0
-                for k = 0 to cluster_idxs.size() - 1
-                    p = swings_h.get(cluster_idxs.get(k))
-                    lvl += p.price
-                    most_recent := math.max(most_recent, p.idx)
-                    used_h.set(cluster_idxs.get(k), true)
-                lvl /= cluster_idxs.size()
-                first_idx = swings_h.get(cluster_idxs.get(0)).idx
-                ln = show_eq ? line.new(first_idx, lvl, bar_index + 5, lvl,
-                    color=color.new(color.aqua, 30),
-                    style=line.style_dashed, width=2) : na
-                lb = show_eq ? label.new(bar_index + 5, lvl,
-                    text="EQH×" + str.tostring(cluster_idxs.size()),
-                    style=label.style_label_left, size=size.small,
-                    color=color.new(color.aqua, 70),
-                    textcolor=color.aqua) : na
-                eq_clusters.push(EQCluster.new(1, lvl, cluster_idxs.size(), most_recent, ln, lb))
+                anchor = swings_h.get(i)
+                cluster_idxs = array.new_int()
+                cluster_idxs.push(i)
+                if i + 1 <= swings_h.size() - 1
+                    for j = i + 1 to swings_h.size() - 1
+                        if used_h.get(j)
+                            continue
+                        other = swings_h.get(j)
+                        if math.abs(other.price - anchor.price) <= tol
+                            cluster_idxs.push(j)
+                if cluster_idxs.size() >= eq_min_touch
+                    lvl = 0.0
+                    most_recent = 0
+                    for k = 0 to cluster_idxs.size() - 1
+                        p = swings_h.get(cluster_idxs.get(k))
+                        lvl += p.price
+                        most_recent := math.max(most_recent, p.idx)
+                        used_h.set(cluster_idxs.get(k), true)
+                    lvl /= cluster_idxs.size()
+                    first_idx = swings_h.get(cluster_idxs.get(0)).idx
+                    ln = show_eq ? line.new(first_idx, lvl, bar_index + 5, lvl,
+                        color=color.new(color.aqua, 30),
+                        style=line.style_dashed, width=2) : na
+                    lb = show_eq ? label.new(bar_index + 5, lvl,
+                        text="EQH×" + str.tostring(cluster_idxs.size()),
+                        style=label.style_label_left, size=size.small,
+                        color=color.new(color.aqua, 70),
+                        textcolor=color.aqua) : na
+                    eq_clusters.push(EQCluster.new(1, lvl, cluster_idxs.size(), most_recent, ln, lb))
         eq_clusters
 
 // Rebuild only when a new pivot was just confirmed (cheap)
@@ -710,14 +715,15 @@ f_detect_sweep_long() =>
     best_src := ""
     best_idx := -1
     // EQ priority
-    for i = 0 to eq_clusters.size() - 1
-        ec = eq_clusters.get(i)
-        if ec.side == -1 and bar_index - ec.most_recent_idx <= sweep_lookback and ec.most_recent_idx < bar_index
-            if f_check_sweep_low(ec.level, ec.most_recent_idx, "EQL×" + str.tostring(ec.touch_count))
-                if best_idx < ec.most_recent_idx
-                    best_lvl := ec.level
-                    best_src := "EQL×" + str.tostring(ec.touch_count)
-                    best_idx := ec.most_recent_idx
+    if eq_clusters.size() > 0
+        for i = 0 to eq_clusters.size() - 1
+            ec = eq_clusters.get(i)
+            if ec.side == -1 and bar_index - ec.most_recent_idx <= sweep_lookback and ec.most_recent_idx < bar_index
+                if f_check_sweep_low(ec.level, ec.most_recent_idx, "EQL×" + str.tostring(ec.touch_count))
+                    if best_idx < ec.most_recent_idx
+                        best_lvl := ec.level
+                        best_src := "EQL×" + str.tostring(ec.touch_count)
+                        best_idx := ec.most_recent_idx
     if best_idx >= 0
         [true, best_lvl, best_src, best_idx]
     else
@@ -746,14 +752,15 @@ f_detect_sweep_short() =>
     best_lvl := na
     best_src := ""
     best_idx := -1
-    for i = 0 to eq_clusters.size() - 1
-        ec = eq_clusters.get(i)
-        if ec.side == 1 and bar_index - ec.most_recent_idx <= sweep_lookback and ec.most_recent_idx < bar_index
-            if f_check_sweep_high(ec.level, ec.most_recent_idx, "EQH×" + str.tostring(ec.touch_count))
-                if best_idx < ec.most_recent_idx
-                    best_lvl := ec.level
-                    best_src := "EQH×" + str.tostring(ec.touch_count)
-                    best_idx := ec.most_recent_idx
+    if eq_clusters.size() > 0
+        for i = 0 to eq_clusters.size() - 1
+            ec = eq_clusters.get(i)
+            if ec.side == 1 and bar_index - ec.most_recent_idx <= sweep_lookback and ec.most_recent_idx < bar_index
+                if f_check_sweep_high(ec.level, ec.most_recent_idx, "EQH×" + str.tostring(ec.touch_count))
+                    if best_idx < ec.most_recent_idx
+                        best_lvl := ec.level
+                        best_src := "EQH×" + str.tostring(ec.touch_count)
+                        best_idx := ec.most_recent_idx
     if best_idx >= 0
         [true, best_lvl, best_src, best_idx]
     else
@@ -789,7 +796,7 @@ f_disp_long_recent(int sweep_idx) =>
     var float fvg_high = na
     var float d_atr = na
     d_idx := -1
-    if not na(atr_v) and atr_v > 0
+    if not na(atr_v) and atr_v > 0 and sweep_idx + 1 <= bar_index - 1
         for k = sweep_idx + 1 to bar_index - 1
             if k - 2 < 0 or k + 1 > bar_index
                 continue
@@ -836,7 +843,7 @@ f_disp_short_recent(int sweep_idx) =>
     var float fvg_high = na
     var float d_atr = na
     d_idx := -1
-    if not na(atr_v) and atr_v > 0
+    if not na(atr_v) and atr_v > 0 and sweep_idx + 1 <= bar_index - 1
         for k = sweep_idx + 1 to bar_index - 1
             if k - 2 < 0 or k + 1 > bar_index
                 continue
