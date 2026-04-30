@@ -210,6 +210,8 @@ bgcolor(show_lunch and in_ny_lunch ? color.new(color.gray, 88) : na, title="NY L
 // =====================================================================
 // 4.  ATR  + pre-computed series (top-level for consistency)
 // =====================================================================
+// DEBUG: visible heartbeat plot — proves the script is running at all
+plotchar(true, title="HB", char="·", location=location.top, color=color.new(color.blue, 70), size=size.tiny)
 atr_v        = ta.atr(atr_len)
 recent_h_60  = ta.highest(high, 60)
 recent_l_60  = ta.lowest(low,  60)
@@ -719,17 +721,19 @@ f_detect_sweep_long() =>
     if best_idx >= 0
         [true, best_lvl, best_src, best_idx]
     else
-        // Fallback single swing low
-        for j = swings_l.size() - 1 to 0
-            sw = swings_l.get(j)
-            if bar_index - sw.idx > sweep_lookback
-                break
-            if sw.idx < bar_index
-                if f_check_sweep_low(sw.price, sw.idx, "single_low")
-                    best_lvl := sw.price
-                    best_src := "single_low"
-                    best_idx := sw.idx
+        // Fallback single swing low — iterate newest→oldest, only if non-empty
+        sz_l = swings_l.size()
+        if sz_l > 0
+            for j = sz_l - 1 to 0 by -1
+                sw = swings_l.get(j)
+                if bar_index - sw.idx > sweep_lookback
                     break
+                if sw.idx < bar_index
+                    if f_check_sweep_low(sw.price, sw.idx, "single_low")
+                        best_lvl := sw.price
+                        best_src := "single_low"
+                        best_idx := sw.idx
+                        break
         if best_idx >= 0
             [true, best_lvl, best_src, best_idx]
         else
@@ -753,16 +757,18 @@ f_detect_sweep_short() =>
     if best_idx >= 0
         [true, best_lvl, best_src, best_idx]
     else
-        for j = swings_h.size() - 1 to 0
-            sw = swings_h.get(j)
-            if bar_index - sw.idx > sweep_lookback
-                break
-            if sw.idx < bar_index
-                if f_check_sweep_high(sw.price, sw.idx, "single_high")
-                    best_lvl := sw.price
-                    best_src := "single_high"
-                    best_idx := sw.idx
+        sz_h = swings_h.size()
+        if sz_h > 0
+            for j = sz_h - 1 to 0 by -1
+                sw = swings_h.get(j)
+                if bar_index - sw.idx > sweep_lookback
                     break
+                if sw.idx < bar_index
+                    if f_check_sweep_high(sw.price, sw.idx, "single_high")
+                        best_lvl := sw.price
+                        best_src := "single_high"
+                        best_idx := sw.idx
+                        break
         if best_idx >= 0
             [true, best_lvl, best_src, best_idx]
         else
