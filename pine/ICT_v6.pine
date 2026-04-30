@@ -19,7 +19,8 @@
 //   • Hard cutoff line (15:55 ET)
 // =====================================================================
 
-strategy("ICT v6 NQ — Full",
+strategy("ICT v6 NQ Full",
+     shorttitle="ICT v6",
      overlay = true,
      pyramiding = 0,
      initial_capital = 100000,
@@ -145,9 +146,7 @@ et_h  = hour(time, NY_TZ)
 et_m  = minute(time, NY_TZ)
 et_min_of_day = et_h * 60 + et_m
 et_dow        = dayofweek(time, NY_TZ)
-et_date       = "" + str.tostring(year(time, NY_TZ)) + "-" +
-                str.tostring(month(time, NY_TZ)) + "-" +
-                str.tostring(dayofmonth(time, NY_TZ))
+et_date       = str.format("{0}-{1}-{2}", year(time, NY_TZ), month(time, NY_TZ), dayofmonth(time, NY_TZ))
 
 f_in_window(int sH, int sM, int eH, int eM) =>
     s = sH * 60 + sM
@@ -209,9 +208,13 @@ bgcolor(show_lunch and in_ny_lunch ? color.new(color.gray, 88) : na, title="NY L
 
 
 // =====================================================================
-// 4.  ATR
+// 4.  ATR  + pre-computed series (top-level for consistency)
 // =====================================================================
-atr_v = ta.atr(atr_len)
+atr_v        = ta.atr(atr_len)
+recent_h_60  = ta.highest(high, 60)
+recent_l_60  = ta.lowest(low,  60)
+prior_h_5    = ta.highest(high, 5)[1]
+prior_l_5    = ta.lowest(low,  5)[1]
 
 
 // =====================================================================
@@ -247,10 +250,7 @@ f_d1_bias() =>
     days_since = bar_index - last_mss_idx
     [last_mss_dir, dr_high, dr_low, days_since]
 
-[d1_mss_raw, d1_dr_high_raw, d1_dr_low_raw, d1_age_raw] =
-    request.security(syminfo.tickerid, "D",
-         f_d1_bias(),
-         lookahead = barmerge.lookahead_off)
+[d1_mss_raw, d1_dr_high_raw, d1_dr_low_raw, d1_age_raw] = request.security(syminfo.tickerid, "D", f_d1_bias(), lookahead = barmerge.lookahead_off)
 
 // Translate to bias label
 f_bias_str(int dir, int age, float prev_close, float dr_h, float dr_l) =>
@@ -730,7 +730,10 @@ f_detect_sweep_long() =>
                     best_src := "single_low"
                     best_idx := sw.idx
                     break
-        best_idx >= 0 ? [true, best_lvl, best_src, best_idx] : [false, na, "", -1]
+        if best_idx >= 0
+            [true, best_lvl, best_src, best_idx]
+        else
+            [false, na, "", -1]
 
 f_detect_sweep_short() =>
     var float best_lvl = na
@@ -760,7 +763,10 @@ f_detect_sweep_short() =>
                     best_src := "single_high"
                     best_idx := sw.idx
                     break
-        best_idx >= 0 ? [true, best_lvl, best_src, best_idx] : [false, na, "", -1]
+        if best_idx >= 0
+            [true, best_lvl, best_src, best_idx]
+        else
+            [false, na, "", -1]
 
 
 // =====================================================================
@@ -790,7 +796,7 @@ f_disp_long_recent(int sweep_idx) =>
             l_t  = low[offset_t]
             h_tm2 = high[offset_t + 2]
             l_tp1 = low[offset_t - 1]
-            atr_at = ta.atr(atr_len)[offset_t + 1]
+            atr_at = atr_v[offset_t + 1]
             if na(atr_at) or atr_at <= 0
                 continue
             body = math.abs(c_t - o_t)
@@ -837,7 +843,7 @@ f_disp_short_recent(int sweep_idx) =>
             l_t = low[offset_t]
             l_tm2 = low[offset_t + 2]
             h_tp1 = high[offset_t - 1]
-            atr_at = ta.atr(atr_len)[offset_t + 1]
+            atr_at = atr_v[offset_t + 1]
             if na(atr_at) or atr_at <= 0
                 continue
             body = math.abs(c_t - o_t)
@@ -909,9 +915,9 @@ if in_asian
         asian_start_bar := bar_index
         if not na(asian_box)
             box.delete(asian_box)
-        asian_box := show_asian ? box.new(bar_index, high, bar_index, low,
-            border_color = color.new(color.gold, 40),
-            bgcolor = color.new(color.gold, 90), border_width = 1) : na
+            asian_box := na
+        if show_asian
+            asian_box := box.new(bar_index, high, bar_index, low, border_color=color.new(color.yellow, 40), bgcolor=color.new(color.yellow, 90), border_width=1)
     asian_h := math.max(asian_h, high)
     asian_l := math.min(asian_l, low)
     if not na(asian_box)
@@ -926,9 +932,9 @@ if in_midnt15
         midnt_start_bar := bar_index
         if not na(midnt_box)
             box.delete(midnt_box)
-        midnt_box := show_midnt ? box.new(bar_index, high, bar_index, low,
-            border_color = color.new(color.silver, 40),
-            bgcolor = color.new(color.silver, 92), border_width = 1) : na
+            midnt_box := na
+        if show_midnt
+            midnt_box := box.new(bar_index, high, bar_index, low, border_color=color.new(color.silver, 40), bgcolor=color.new(color.silver, 92), border_width=1)
     midnt_h := math.max(midnt_h, high)
     midnt_l := math.min(midnt_l, low)
     if not na(midnt_box)
@@ -1018,10 +1024,10 @@ f_engulfing_bear() =>
     close[1] > open[1] and close < open and close < open[1]
 
 f_micro_mss_bull() =>
-    close > ta.highest(high, 5)[1]
+    close > prior_h_5
 
 f_micro_mss_bear() =>
-    close < ta.lowest(low, 5)[1]
+    close < prior_l_5
 
 f_find_target_long(float entry, float stop) =>
     risk = entry - stop
@@ -1049,7 +1055,7 @@ f_find_target_long(float entry, float stop) =>
                 best := d1_dr_high_raw
                 lbl := "d1_dr_high"
         // Recent swing high (last 60 bars)
-        rsh = ta.highest(high, 60)[1]
+        rsh = recent_h_60[1]
         if not na(rsh) and rsh > entry and rsh >= min_t
             if na(best) or rsh < best
                 best := rsh
@@ -1078,7 +1084,7 @@ f_find_target_short(float entry, float stop) =>
             if na(best) or d1_dr_low_raw > best
                 best := d1_dr_low_raw
                 lbl := "d1_dr_low"
-        rsl = ta.lowest(low, 60)[1]
+        rsl = recent_l_60[1]
         if not na(rsl) and rsl < entry and rsl <= min_t
             if na(best) or rsl > best
                 best := rsl
@@ -1154,16 +1160,14 @@ if tr.active and barstate.isconfirmed
                 strategy.close("ICT", comment="TP")
                 f_clear_trade()
 
-    // Chandelier trail (after first partial)
+    // Chandelier trail (after first partial) — uses pre-computed recent_h_60/recent_l_60
     if tr.active and enable_trail and tr.partials_done >= 1
         if d == 1
-            hh = ta.highest(high, math.min(60, math.max(1, bars_in)))
-            new_stop = hh - trail_atr_mult * atr_v
+            new_stop = recent_h_60 - trail_atr_mult * atr_v
             if new_stop > tr.stop_price
                 tr.stop_price := new_stop
         else
-            ll = ta.lowest(low, math.min(60, math.max(1, bars_in)))
-            new_stop = ll + trail_atr_mult * atr_v
+            new_stop = recent_l_60 + trail_atr_mult * atr_v
             if new_stop < tr.stop_price
                 tr.stop_price := new_stop
 
@@ -1244,6 +1248,31 @@ if not tr.active and ote.active and barstate.isconfirmed
 
 
 // ---------- IDLE: scan for new setup ----------
+// Always evaluate detection functions at top level (Pine v6 consistency requirement)
+[sw_l_hit, sw_l_lvl, sw_l_src, sw_l_idx] = f_detect_sweep_long()
+[sw_s_hit, sw_s_lvl, sw_s_src, sw_s_idx] = f_detect_sweep_short()
+disp_l_sweep_idx = sw_l_hit ? sw_l_idx : math.max(0, bar_index - 60)
+disp_s_sweep_idx = sw_s_hit ? sw_s_idx : math.max(0, bar_index - 60)
+[d_l_idx, d_l_o, d_l_c, d_l_h, d_l_l, _flf1, _fhf1, d_l_atr] = f_disp_long_recent(disp_l_sweep_idx)
+[d_s_idx, d_s_o, d_s_c, d_s_h, d_s_l, _slf1, _shf1, d_s_atr] = f_disp_short_recent(disp_s_sweep_idx)
+
+// Compute hypothetical OTE/stop for each direction
+ote_l_leg     = sw_l_hit and d_l_idx > 0 ? d_l_h - sw_l_lvl : 0.0
+ote_l_limit   = sw_l_hit and d_l_idx > 0 ? d_l_h - ote_mid_pct  * ote_l_leg : na
+ote_l_hi      = sw_l_hit and d_l_idx > 0 ? d_l_h - ote_low_pct  * ote_l_leg : na
+ote_l_lo      = sw_l_hit and d_l_idx > 0 ? d_l_h - ote_high_pct * ote_l_leg : na
+ote_l_atr_buf = math.min(stop_atr_buf * atr_v, stop_max_atr * atr_v)
+ote_l_stop    = sw_l_hit ? sw_l_lvl - ote_l_atr_buf : na
+[ote_l_tgt, ote_l_tlbl] = f_find_target_long(nz(ote_l_limit, close), nz(ote_l_stop, close - 1))
+
+ote_s_leg     = sw_s_hit and d_s_idx > 0 ? sw_s_lvl - d_s_l : 0.0
+ote_s_limit   = sw_s_hit and d_s_idx > 0 ? d_s_l + ote_mid_pct  * ote_s_leg : na
+ote_s_hi      = sw_s_hit and d_s_idx > 0 ? d_s_l + ote_high_pct * ote_s_leg : na
+ote_s_lo      = sw_s_hit and d_s_idx > 0 ? d_s_l + ote_low_pct  * ote_s_leg : na
+ote_s_atr_buf = math.min(stop_atr_buf * atr_v, stop_max_atr * atr_v)
+ote_s_stop    = sw_s_hit ? sw_s_lvl + ote_s_atr_buf : na
+[ote_s_tgt, ote_s_tlbl] = f_find_target_short(nz(ote_s_limit, close), nz(ote_s_stop, close + 1))
+
 can_arm = not tr.active and not ote.active and barstate.isconfirmed
 can_arm := can_arm and (not enable_kz_gate or in_any_kz_v)
 can_arm := can_arm and (not enable_hard_cutoff or not past_hard_cutoff_v)
@@ -1257,7 +1286,6 @@ if can_arm and d1_bias != "neutral"
     direction_int = d1_bias == "bull" ? 1 : -1
     long_ok  = direction_int == 1 and enable_long
     short_ok = direction_int == -1 and enable_short
-    // PD gate
     pd_ok = true
     if direction_int == 1 and require_disc_long and not na(d1_pd_pos)
         pd_ok := d1_pd_pos <= pd_thresh
@@ -1265,116 +1293,68 @@ if can_arm and d1_bias != "neutral"
         pd_ok := d1_pd_pos >= 1.0 - pd_thresh
 
     if (long_ok or short_ok) and pd_ok
-        if direction_int == 1
-            [hit, lvl, src, sw_idx] = f_detect_sweep_long()
-            if hit
-                if show_sweep
-                    label.new(bar_index, lvl, text="⚡SSL " + src,
-                        style=label.style_label_up, size=size.tiny,
-                        color=color.new(color.red, 50), textcolor=color.white)
-                    line.new(sw_idx, lvl, bar_index, lvl,
-                        color=color.new(color.red, 30), style=line.style_dotted, width=1)
-                [d_idx, d_o, d_c, d_h, d_l, _fl, _fh, d_atr_at] = f_disp_long_recent(sw_idx)
-                if d_idx > 0 and d_atr_at > 0
-                    leg = d_h - lvl
-                    if leg > 0
-                        atr_now = atr_v
-                        atr_buf = math.min(stop_atr_buf * atr_now, stop_max_atr * atr_now)
-                        ote_limit = d_h - ote_mid_pct * leg
-                        ote_high  = d_h - ote_low_pct * leg
-                        ote_low   = d_h - ote_high_pct * leg
-                        stop_pr   = lvl - atr_buf
-                        local_eq = (lvl + d_h) / 2
-                        if ote_limit < local_eq
-                            [target_p, target_lbl] = f_find_target_long(ote_limit, stop_pr)
-                            if not na(target_p)
-                                ote.active := true
-                                ote.direction := 1
-                                ote.sweep_idx := sw_idx
-                                ote.disp_idx := d_idx
-                                ote.place_idx := bar_index
-                                ote.expire_idx := bar_index + ote_fill_max_bars
-                                ote.limit_price := ote_limit
-                                ote.stop_price := stop_pr
-                                ote.target_price := target_p
-                                ote.ote_low := ote_low
-                                ote.ote_high := ote_high
-                                ote.sweep_level := lvl
-                                ote.disp_extreme := d_h
-                                ote.bias := "bull"
-                                ote.kz := active_kz
-                                if show_ote
-                                    ote.ote_bx := box.new(bar_index, ote_high, bar_index + ote_fill_max_bars, ote_low,
-                                        border_color = color.new(color.aqua, 30),
-                                        bgcolor = color.new(color.aqua, 90),
-                                        border_width = 1)
-                                    ote.limit_ln := line.new(bar_index, ote_limit, bar_index + ote_fill_max_bars, ote_limit,
-                                        color=color.aqua, style=line.style_solid, width=2)
-                                    ote.stop_ln := line.new(bar_index, stop_pr, bar_index + ote_fill_max_bars, stop_pr,
-                                        color=color.new(color.red, 30), style=line.style_dashed)
-                                    ote.target_ln := line.new(bar_index, target_p, bar_index + ote_fill_max_bars, target_p,
-                                        color=color.new(color.green, 30), style=line.style_dashed)
-                                    ote.info_lb := label.new(bar_index + ote_fill_max_bars, ote_limit,
-                                        text="OTE↑ " + src + "\nE=" + str.tostring(ote_limit, "#.##") +
-                                             "\nS=" + str.tostring(stop_pr, "#.##") +
-                                             "\nT=" + str.tostring(target_p, "#.##") + " (" + target_lbl + ")",
-                                        style=label.style_label_left, size=size.small,
-                                        color=color.new(color.aqua, 60), textcolor=color.white)
-        if direction_int == -1
-            [hit, lvl, src, sw_idx] = f_detect_sweep_short()
-            if hit
-                if show_sweep
-                    label.new(bar_index, lvl, text="⚡BSL " + src,
-                        style=label.style_label_down, size=size.tiny,
-                        color=color.new(color.maroon, 50), textcolor=color.white)
-                    line.new(sw_idx, lvl, bar_index, lvl,
-                        color=color.new(color.maroon, 30), style=line.style_dotted, width=1)
-                [d_idx, d_o, d_c, d_h, d_l, _fl, _fh, d_atr_at] = f_disp_short_recent(sw_idx)
-                if d_idx > 0 and d_atr_at > 0
-                    leg = lvl - d_l
-                    if leg > 0
-                        atr_now = atr_v
-                        atr_buf = math.min(stop_atr_buf * atr_now, stop_max_atr * atr_now)
-                        ote_limit = d_l + ote_mid_pct * leg
-                        ote_high  = d_l + ote_high_pct * leg
-                        ote_low   = d_l + ote_low_pct * leg
-                        stop_pr   = lvl + atr_buf
-                        local_eq = (lvl + d_l) / 2
-                        if ote_limit > local_eq
-                            [target_p, target_lbl] = f_find_target_short(ote_limit, stop_pr)
-                            if not na(target_p)
-                                ote.active := true
-                                ote.direction := -1
-                                ote.sweep_idx := sw_idx
-                                ote.disp_idx := d_idx
-                                ote.place_idx := bar_index
-                                ote.expire_idx := bar_index + ote_fill_max_bars
-                                ote.limit_price := ote_limit
-                                ote.stop_price := stop_pr
-                                ote.target_price := target_p
-                                ote.ote_low := ote_low
-                                ote.ote_high := ote_high
-                                ote.sweep_level := lvl
-                                ote.disp_extreme := d_l
-                                ote.bias := "bear"
-                                ote.kz := active_kz
-                                if show_ote
-                                    ote.ote_bx := box.new(bar_index, ote_high, bar_index + ote_fill_max_bars, ote_low,
-                                        border_color = color.new(color.maroon, 30),
-                                        bgcolor = color.new(color.maroon, 90),
-                                        border_width = 1)
-                                    ote.limit_ln := line.new(bar_index, ote_limit, bar_index + ote_fill_max_bars, ote_limit,
-                                        color=color.maroon, style=line.style_solid, width=2)
-                                    ote.stop_ln := line.new(bar_index, stop_pr, bar_index + ote_fill_max_bars, stop_pr,
-                                        color=color.new(color.red, 30), style=line.style_dashed)
-                                    ote.target_ln := line.new(bar_index, target_p, bar_index + ote_fill_max_bars, target_p,
-                                        color=color.new(color.green, 30), style=line.style_dashed)
-                                    ote.info_lb := label.new(bar_index + ote_fill_max_bars, ote_limit,
-                                        text="OTE↓ " + src + "\nE=" + str.tostring(ote_limit, "#.##") +
-                                             "\nS=" + str.tostring(stop_pr, "#.##") +
-                                             "\nT=" + str.tostring(target_p, "#.##") + " (" + target_lbl + ")",
-                                        style=label.style_label_left, size=size.small,
-                                        color=color.new(color.maroon, 60), textcolor=color.white)
+        if direction_int == 1 and sw_l_hit
+            if show_sweep
+                label.new(bar_index, sw_l_lvl, text="⚡SSL " + sw_l_src,
+                    style=label.style_label_up, size=size.tiny,
+                    color=color.new(color.red, 50), textcolor=color.white)
+                line.new(sw_l_idx, sw_l_lvl, bar_index, sw_l_lvl,
+                    color=color.new(color.red, 30), style=line.style_dotted, width=1)
+            if d_l_idx > 0 and d_l_atr > 0 and ote_l_leg > 0
+                local_eq = (sw_l_lvl + d_l_h) / 2
+                if ote_l_limit < local_eq and not na(ote_l_tgt)
+                    ote.active := true
+                    ote.direction := 1
+                    ote.sweep_idx := sw_l_idx
+                    ote.disp_idx := d_l_idx
+                    ote.place_idx := bar_index
+                    ote.expire_idx := bar_index + ote_fill_max_bars
+                    ote.limit_price := ote_l_limit
+                    ote.stop_price := ote_l_stop
+                    ote.target_price := ote_l_tgt
+                    ote.ote_low := ote_l_lo
+                    ote.ote_high := ote_l_hi
+                    ote.sweep_level := sw_l_lvl
+                    ote.disp_extreme := d_l_h
+                    ote.bias := "bull"
+                    ote.kz := active_kz
+                    if show_ote
+                        ote.ote_bx := box.new(bar_index, ote_l_hi, bar_index + ote_fill_max_bars, ote_l_lo, border_color=color.new(color.aqua, 30), bgcolor=color.new(color.aqua, 90), border_width=1)
+                        ote.limit_ln := line.new(bar_index, ote_l_limit, bar_index + ote_fill_max_bars, ote_l_limit, color=color.aqua, style=line.style_solid, width=2)
+                        ote.stop_ln := line.new(bar_index, ote_l_stop, bar_index + ote_fill_max_bars, ote_l_stop, color=color.new(color.red, 30), style=line.style_dashed)
+                        ote.target_ln := line.new(bar_index, ote_l_tgt, bar_index + ote_fill_max_bars, ote_l_tgt, color=color.new(color.green, 30), style=line.style_dashed)
+                        ote.info_lb := label.new(bar_index + ote_fill_max_bars, ote_l_limit, text="OTE↑ " + sw_l_src + "\nE=" + str.tostring(ote_l_limit, "#.##") + "\nS=" + str.tostring(ote_l_stop, "#.##") + "\nT=" + str.tostring(ote_l_tgt, "#.##") + " (" + ote_l_tlbl + ")", style=label.style_label_left, size=size.small, color=color.new(color.aqua, 60), textcolor=color.white)
+        if direction_int == -1 and sw_s_hit
+            if show_sweep
+                label.new(bar_index, sw_s_lvl, text="⚡BSL " + sw_s_src,
+                    style=label.style_label_down, size=size.tiny,
+                    color=color.new(color.maroon, 50), textcolor=color.white)
+                line.new(sw_s_idx, sw_s_lvl, bar_index, sw_s_lvl,
+                    color=color.new(color.maroon, 30), style=line.style_dotted, width=1)
+            if d_s_idx > 0 and d_s_atr > 0 and ote_s_leg > 0
+                local_eq = (sw_s_lvl + d_s_l) / 2
+                if ote_s_limit > local_eq and not na(ote_s_tgt)
+                    ote.active := true
+                    ote.direction := -1
+                    ote.sweep_idx := sw_s_idx
+                    ote.disp_idx := d_s_idx
+                    ote.place_idx := bar_index
+                    ote.expire_idx := bar_index + ote_fill_max_bars
+                    ote.limit_price := ote_s_limit
+                    ote.stop_price := ote_s_stop
+                    ote.target_price := ote_s_tgt
+                    ote.ote_low := ote_s_lo
+                    ote.ote_high := ote_s_hi
+                    ote.sweep_level := sw_s_lvl
+                    ote.disp_extreme := d_s_l
+                    ote.bias := "bear"
+                    ote.kz := active_kz
+                    if show_ote
+                        ote.ote_bx := box.new(bar_index, ote_s_hi, bar_index + ote_fill_max_bars, ote_s_lo, border_color=color.new(color.maroon, 30), bgcolor=color.new(color.maroon, 90), border_width=1)
+                        ote.limit_ln := line.new(bar_index, ote_s_limit, bar_index + ote_fill_max_bars, ote_s_limit, color=color.maroon, style=line.style_solid, width=2)
+                        ote.stop_ln := line.new(bar_index, ote_s_stop, bar_index + ote_fill_max_bars, ote_s_stop, color=color.new(color.red, 30), style=line.style_dashed)
+                        ote.target_ln := line.new(bar_index, ote_s_tgt, bar_index + ote_fill_max_bars, ote_s_tgt, color=color.new(color.green, 30), style=line.style_dashed)
+                        ote.info_lb := label.new(bar_index + ote_fill_max_bars, ote_s_limit, text="OTE↓ " + sw_s_src + "\nE=" + str.tostring(ote_s_limit, "#.##") + "\nS=" + str.tostring(ote_s_stop, "#.##") + "\nT=" + str.tostring(ote_s_tgt, "#.##") + " (" + ote_s_tlbl + ")", style=label.style_label_left, size=size.small, color=color.new(color.maroon, 60), textcolor=color.white)
 
 
 // =====================================================================
