@@ -1,0 +1,403 @@
+//@version=6
+// =====================================================================
+// ICT v6 LITE — indicator-only with core visualizations
+// (no strategy entries — just the chart annotations)
+// =====================================================================
+
+indicator("ICT v6 Lite", overlay = true,
+     max_labels_count = 500, max_boxes_count = 500, max_lines_count = 500,
+     max_bars_back = 1000)
+
+// ─── Inputs ──────────────────────────────────────────────────────────
+g_viz       = "▼ Viz"
+show_kz     = input.bool(true,  "Kill zones",         group=g_viz)
+show_swings = input.bool(true,  "Swings",             group=g_viz)
+show_fvg    = input.bool(true,  "FVG",                group=g_viz)
+show_ob     = input.bool(true,  "OB",                 group=g_viz)
+show_brk    = input.bool(true,  "Breaker",            group=g_viz)
+show_d1     = input.bool(true,  "D1 bias label",      group=g_viz)
+show_status = input.bool(true,  "Status table",       group=g_viz)
+show_asian  = input.bool(true,  "Asian range",        group=g_viz)
+show_midnt  = input.bool(true,  "Midnight 15m",       group=g_viz)
+
+g_p         = "▼ Params"
+fractal_n   = input.int(3, "Fractal N", minval=2, group=g_p)
+atr_len     = input.int(14, "ATR len",  group=g_p)
+disp_atr    = input.float(1.0, "Displacement N×ATR",  group=g_p)
+fvg_min_atr = input.float(0.2, "FVG min N×ATR",       group=g_p)
+fvg_max_age = input.int(480, "FVG max age (bars)",    group=g_p)
+ob_max_age  = input.int(1440, "OB max age",           group=g_p)
+swing_keep  = input.int(80, "Swings kept per side",   group=g_p)
+
+
+// =====================================================================
+// 1.  TIME / KILL ZONES (ET)
+// =====================================================================
+NY_TZ  = "America/New_York"
+et_h   = hour(time, NY_TZ)
+et_m   = minute(time, NY_TZ)
+et_min = et_h * 60 + et_m
+et_dow = dayofweek(time, NY_TZ)
+
+f_in(int sH, int sM, int eH, int eM) =>
+    s = sH * 60 + sM
+    e = eH * 60 + eM
+    et_min >= s and et_min < e
+
+in_london_kz       = f_in(2, 0, 5, 0)
+in_london_sb       = f_in(3, 0, 4, 0)
+in_london_close_kz = f_in(10, 0, 12, 0)
+in_ny_am_kz        = f_in(8, 30, 11, 0)
+in_ny_am_sb        = f_in(10, 0, 11, 0)
+in_ny_pm_kz        = f_in(13, 30, 16, 0)
+in_ny_pm_sb        = f_in(14, 0, 15, 0)
+in_ny_lunch        = f_in(12, 0, 13, 0)
+past_cutoff        = et_min >= (15 * 60 + 55)
+
+active_kz = in_ny_lunch ? "LUNCH" :
+       in_ny_am_sb ? "NY_AM_SB" :
+       in_ny_pm_sb ? "NY_PM_SB" :
+       in_london_sb ? "London_SB" :
+       in_ny_am_kz ? "NY_AM_KZ" :
+       in_ny_pm_kz ? "NY_PM_KZ" :
+       in_london_kz ? "London_KZ" :
+       in_london_close_kz ? "London_Close_KZ" : "—"
+
+kz_color = in_ny_lunch ? color.new(color.gray, 92) :
+       in_ny_am_sb ? color.new(color.yellow, 80) :
+       in_ny_pm_sb ? color.new(color.lime, 80) :
+       in_london_sb ? color.new(color.fuchsia, 85) :
+       in_ny_am_kz ? color.new(color.yellow, 92) :
+       in_ny_pm_kz ? color.new(color.lime, 92) :
+       in_london_kz ? color.new(color.aqua, 92) :
+       in_london_close_kz ? color.new(color.orange, 92) : na
+
+bgcolor(show_kz ? kz_color : na, title="KZ")
+
+
+// =====================================================================
+// 2.  ATR + D1 BIAS (via request.security)
+// =====================================================================
+atr_v = ta.atr(atr_len)
+
+f_d1_bias() =>
+    sh = ta.pivothigh(2, 2)
+    sl = ta.pivotlow(2, 2)
+    var float last_sh = na
+    var float last_sl = na
+    var int last_dir = 0
+    if not na(sh)
+        last_sh := sh
+    if not na(sl)
+        last_sl := sl
+    atr_d = ta.atr(14)
+    body  = math.abs(close - open)
+    if not na(last_sh) and close > last_sh and body >= atr_d
+        last_dir := 1
+    if not na(last_sl) and close < last_sl and body >= atr_d
+        last_dir := -1
+    last_dir
+
+d1_dir = request.security(syminfo.tickerid, "D", f_d1_bias(), lookahead=barmerge.lookahead_off)
+d1_bias = d1_dir == 1 ? "bull" : d1_dir == -1 ? "bear" : "neutral"
+
+
+// =====================================================================
+// 3.  TYPES + ARRAYS
+// =====================================================================
+type FVG
+    int   idx
+    int   dir
+    float lo
+    float hi
+    bool  filled
+    box   bx
+
+type OB
+    int   idx
+    int   dir
+    float lo
+    float hi
+    int   state    // 0 fresh, 1 tested, 2 broken
+    bool  breaker
+    box   bx
+    label lb
+
+type Pivot
+    int   idx
+    int   side
+    float price
+    label lb
+
+var array<FVG>   fvgs    = array.new<FVG>()
+var array<OB>    obs     = array.new<OB>()
+var array<Pivot> swings  = array.new<Pivot>()
+
+
+// =====================================================================
+// 4.  PIVOT DETECTION
+// =====================================================================
+piv_h = ta.pivothigh(fractal_n, fractal_n)
+piv_l = ta.pivotlow(fractal_n, fractal_n)
+piv_idx = bar_index - fractal_n
+
+if not na(piv_h)
+    label lb = na
+    if show_swings
+        lb := label.new(piv_idx, piv_h, text="▲", style=label.style_label_down,
+            color=color.new(color.red, 80), textcolor=color.red, size=size.tiny)
+    swings.push(Pivot.new(piv_idx, 1, piv_h, lb))
+
+if not na(piv_l)
+    label lb = na
+    if show_swings
+        lb := label.new(piv_idx, piv_l, text="▼", style=label.style_label_up,
+            color=color.new(color.green, 80), textcolor=color.green, size=size.tiny)
+    swings.push(Pivot.new(piv_idx, -1, piv_l, lb))
+
+while swings.size() > swing_keep * 2
+    old = swings.shift()
+    if not na(old.lb)
+        label.delete(old.lb)
+
+
+// =====================================================================
+// 5.  FAIR VALUE GAPS (3-bar)
+// =====================================================================
+if barstate.isconfirmed and not na(atr_v) and atr_v > 0 and bar_index >= 2
+    // Bullish: low[0] > high[2]
+    if low > high[2]
+        sz = low - high[2]
+        if sz >= fvg_min_atr * atr_v
+            box bx = na
+            if show_fvg
+                bx := box.new(bar_index - 2, low, bar_index, high[2],
+                    border_color=color.new(color.green, 50),
+                    bgcolor=color.new(color.green, 85), border_width=1)
+            fvgs.push(FVG.new(bar_index - 1, 1, high[2], low, false, bx))
+    // Bearish: high[0] < low[2]
+    if high < low[2]
+        sz = low[2] - high
+        if sz >= fvg_min_atr * atr_v
+            box bx = na
+            if show_fvg
+                bx := box.new(bar_index - 2, low[2], bar_index, high,
+                    border_color=color.new(color.red, 50),
+                    bgcolor=color.new(color.red, 85), border_width=1)
+            fvgs.push(FVG.new(bar_index - 1, -1, high, low[2], false, bx))
+
+// Cleanup FVGs
+if fvgs.size() > 0
+    i = 0
+    while i < fvgs.size()
+        f = fvgs.get(i)
+        age = bar_index - f.idx
+        if not f.filled
+            if (f.dir == 1 and low <= f.lo) or (f.dir == -1 and high >= f.hi)
+                f.filled := true
+                if not na(f.bx)
+                    f.bx.set_bgcolor(color.new(color.gray, 90))
+                    f.bx.set_border_color(color.new(color.gray, 60))
+        if not f.filled and not na(f.bx)
+            f.bx.set_right(bar_index + 1)
+        if age > fvg_max_age or (f.filled and age > 60)
+            if not na(f.bx)
+                box.delete(f.bx)
+            fvgs.remove(i)
+        else
+            i += 1
+
+
+// =====================================================================
+// 6.  ORDER BLOCKS
+// =====================================================================
+if barstate.isconfirmed and bar_index >= 4 and not na(atr_v) and atr_v > 0
+    ob_idx = bar_index - 1
+    disp_body = math.abs(close - open)
+    ob_body = math.abs(close[1] - open[1])
+    ob_h = high[1]
+    ob_l = low[1]
+    ob_range = ob_h - ob_l
+    body_ratio = ob_range > 0 ? ob_body / ob_range : 0.0
+    is_disp_bull = close > open and disp_body >= disp_atr * atr_v and close > ob_h
+    is_disp_bear = close < open and disp_body >= disp_atr * atr_v and close < ob_l
+    is_ob_bear = close[1] < open[1]
+    is_ob_bull = close[1] > open[1]
+    if is_ob_bear and is_disp_bull and (body_ratio >= 0.3 or ob_body >= 0.3 * atr_v)
+        box bx = na
+        label lb = na
+        if show_ob
+            bx := box.new(ob_idx, ob_h, bar_index + 30, ob_l,
+                border_color=color.new(color.blue, 30),
+                bgcolor=color.new(color.blue, 88), border_width=1)
+            lb := label.new(bar_index + 30, ob_l, text="OB↑",
+                style=label.style_label_left,
+                color=color.new(color.blue, 60), textcolor=color.blue, size=size.tiny)
+        obs.push(OB.new(ob_idx, 1, ob_l, ob_h, 0, false, bx, lb))
+    if is_ob_bull and is_disp_bear and (body_ratio >= 0.3 or ob_body >= 0.3 * atr_v)
+        box bx = na
+        label lb = na
+        if show_ob
+            bx := box.new(ob_idx, ob_h, bar_index + 30, ob_l,
+                border_color=color.new(color.orange, 30),
+                bgcolor=color.new(color.orange, 88), border_width=1)
+            lb := label.new(bar_index + 30, ob_h, text="OB↓",
+                style=label.style_label_left,
+                color=color.new(color.orange, 60), textcolor=color.orange, size=size.tiny)
+        obs.push(OB.new(ob_idx, -1, ob_l, ob_h, 0, false, bx, lb))
+
+// Cleanup + breaker promotion
+if obs.size() > 0
+    i = 0
+    while i < obs.size()
+        o = obs.get(i)
+        age = bar_index - o.idx
+        if o.state == 0
+            if o.dir == 1
+                if low <= o.hi and low >= o.lo
+                    o.state := 1
+                if close < o.lo
+                    o.state := 2
+                    if not o.breaker
+                        o.breaker := true
+                        if show_brk and not na(o.bx)
+                            o.bx.set_bgcolor(color.new(color.purple, 75))
+                            o.bx.set_border_color(color.new(color.purple, 30))
+                            o.bx.set_border_width(2)
+                        if show_brk and not na(o.lb)
+                            o.lb.set_text("BPR↓")
+                            o.lb.set_textcolor(color.purple)
+            else
+                if high >= o.lo and high <= o.hi
+                    o.state := 1
+                if close > o.hi
+                    o.state := 2
+                    if not o.breaker
+                        o.breaker := true
+                        if show_brk and not na(o.bx)
+                            o.bx.set_bgcolor(color.new(color.purple, 75))
+                            o.bx.set_border_color(color.new(color.purple, 30))
+                            o.bx.set_border_width(2)
+                        if show_brk and not na(o.lb)
+                            o.lb.set_text("BPR↑")
+                            o.lb.set_textcolor(color.purple)
+        if not na(o.bx) and o.state != 2
+            o.bx.set_right(bar_index + 30)
+        if age > ob_max_age or (o.state == 2 and age > ob_max_age / 2)
+            if not na(o.bx)
+                box.delete(o.bx)
+            if not na(o.lb)
+                label.delete(o.lb)
+            obs.remove(i)
+        else
+            i += 1
+
+
+// =====================================================================
+// 7.  ASIAN RANGE + MIDNIGHT 15m
+// =====================================================================
+today_id = year(time, NY_TZ) * 10000 + month(time, NY_TZ) * 100 + dayofmonth(time, NY_TZ)
+var int last_day = -1
+new_day = today_id != last_day
+if new_day
+    last_day := today_id
+
+in_asian = (et_h >= 20) or (et_h == 0 and et_m == 0)
+in_midnt = et_h == 0 and et_m < 15
+
+var float a_h = na
+var float a_l = na
+var box a_bx = na
+var float m_h = na
+var float m_l = na
+var box m_bx = na
+
+if in_asian
+    if na(a_h) or new_day
+        a_h := high
+        a_l := low
+        if not na(a_bx)
+            box.delete(a_bx)
+            a_bx := na
+        if show_asian
+            a_bx := box.new(bar_index, high, bar_index, low,
+                border_color=color.new(color.yellow, 40),
+                bgcolor=color.new(color.yellow, 90), border_width=1)
+    a_h := math.max(a_h, high)
+    a_l := math.min(a_l, low)
+    if not na(a_bx)
+        a_bx.set_top(a_h)
+        a_bx.set_bottom(a_l)
+        a_bx.set_right(bar_index)
+
+if in_midnt
+    if na(m_h) or new_day
+        m_h := high
+        m_l := low
+        if not na(m_bx)
+            box.delete(m_bx)
+            m_bx := na
+        if show_midnt
+            m_bx := box.new(bar_index, high, bar_index, low,
+                border_color=color.new(color.silver, 40),
+                bgcolor=color.new(color.silver, 92), border_width=1)
+    m_h := math.max(m_h, high)
+    m_l := math.min(m_l, low)
+    if not na(m_bx)
+        m_bx.set_top(m_h)
+        m_bx.set_bottom(m_l)
+        m_bx.set_right(bar_index)
+
+
+// =====================================================================
+// 8.  D1 BIAS DAY-START LABEL
+// =====================================================================
+if show_d1 and new_day and not na(atr_v)
+    e = d1_bias == "bull" ? "🟢" : d1_bias == "bear" ? "🔴" : "⚪"
+    label.new(bar_index, high + atr_v * 1.2,
+        text=e + " D1 " + d1_bias,
+        style=label.style_label_down, size=size.small,
+        color=d1_bias == "bull" ? color.new(color.green, 50) :
+              d1_bias == "bear" ? color.new(color.red, 50) :
+              color.new(color.gray, 50),
+        textcolor=color.white)
+
+// Vertical line at hard cutoff
+prev_cutoff = past_cutoff[1]
+if past_cutoff and not prev_cutoff and not na(atr_v)
+    line.new(bar_index, low - atr_v * 0.5, bar_index, high + atr_v * 0.5,
+        color=color.new(color.red, 30), style=line.style_dashed, width=1)
+
+
+// =====================================================================
+// 9.  STATUS TABLE
+// =====================================================================
+var table tbl = table.new(position.top_right, 2, 5,
+     frame_color=color.gray, frame_width=1)
+if show_status and barstate.islast
+    table.cell(tbl, 0, 0, "ICT Lite", text_color=color.white,
+         bgcolor=color.new(color.navy, 30), text_size=size.normal)
+    table.cell(tbl, 1, 0, syminfo.ticker, text_color=color.white,
+         bgcolor=color.new(color.navy, 30), text_size=size.normal)
+    bias_color = d1_bias == "bull" ? color.new(color.green, 40) :
+         d1_bias == "bear" ? color.new(color.red, 40) : color.new(color.gray, 40)
+    table.cell(tbl, 0, 1, "D1", text_color=color.silver,
+         bgcolor=color.new(color.black, 60))
+    table.cell(tbl, 1, 1, d1_bias, text_color=color.white, bgcolor=bias_color)
+    table.cell(tbl, 0, 2, "KZ", text_color=color.silver,
+         bgcolor=color.new(color.black, 60))
+    table.cell(tbl, 1, 2, active_kz, text_color=color.white,
+         bgcolor=color.new(color.black, 70))
+    table.cell(tbl, 0, 3, "FVG", text_color=color.silver,
+         bgcolor=color.new(color.black, 60))
+    table.cell(tbl, 1, 3, str.tostring(fvgs.size()), text_color=color.white,
+         bgcolor=color.new(color.black, 70))
+    table.cell(tbl, 0, 4, "OB", text_color=color.silver,
+         bgcolor=color.new(color.black, 60))
+    table.cell(tbl, 1, 4, str.tostring(obs.size()), text_color=color.white,
+         bgcolor=color.new(color.black, 70))
+
+
+// Heartbeat — confirms script runs
+plotchar(true, title="HB", char="·", location=location.top,
+     color=color.new(color.blue, 60), size=size.tiny)
