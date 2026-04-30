@@ -1,0 +1,1431 @@
+//@version=6
+// =====================================================================
+// ICT v6 — 2022 Model — Full Strategy + Self-Annotating Visualization
+// Source: ~/Desktop/ICT/ict_v3/ (Python, ~5,000 LOC)
+// Backtest origin (Python on NQ futures): 715 trades, cd-Sharpe +4.68, t-stat 18
+//
+// Components rendered (all toggleable):
+//   • Daily bias (D1 MSS direction, frozen at 00:00 ET)
+//   • Kill zones: London / NY AM / NY PM / Silver Bullets / London Close / Lunch
+//   • Asian range + Midnight 15m range
+//   • Local extremes (swing H/L)
+//   • Equal-Lows / Equal-Highs clusters (stop magnets)
+//   • Sweeps (pierce + reclaim)
+//   • Displacement bars + 3-bar FVGs (bullish + bearish)
+//   • Order Blocks + Breaker Blocks (BPR)
+//   • OTE zone (62 / 70.5 / 79) on each setup
+//   • Entry / stop / target lines + R-ladder partial exits + chandelier trail
+//   • NDOG / NWOG opening gaps
+//   • Hard cutoff line (15:55 ET)
+// =====================================================================
+
+strategy("ICT v6 NQ — Full",
+     overlay = true,
+     pyramiding = 0,
+     initial_capital = 100000,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_contract,
+     commission_value = 2.0,
+     slippage = 2,
+     calc_on_every_tick = false,
+     process_orders_on_close = true,
+     max_labels_count = 500,
+     max_boxes_count = 500,
+     max_lines_count = 500,
+     max_bars_back = 2000)
+
+
+// =====================================================================
+// 1.  INPUTS
+// =====================================================================
+
+// ─── Visualization toggles ────────────────────────────────────────────
+g_viz       = "▼ Visualization"
+show_kz     = input.bool(true,  "Kill zones (background)",       group=g_viz)
+show_lunch  = input.bool(true,  "NY Lunch / Hard cutoff",        group=g_viz)
+show_d1bias = input.bool(true,  "D1 bias status",                group=g_viz)
+show_swings = input.bool(true,  "Swing pivots (▲▼)",             group=g_viz)
+show_eq     = input.bool(true,  "Equal Highs / Lows clusters",   group=g_viz)
+show_sweep  = input.bool(true,  "Sweeps (⚡)",                    group=g_viz)
+show_disp   = input.bool(true,  "Displacement bars",             group=g_viz)
+show_fvg    = input.bool(true,  "Fair Value Gaps",               group=g_viz)
+show_ob     = input.bool(true,  "Order Blocks",                  group=g_viz)
+show_brk    = input.bool(true,  "Breaker Blocks (BPR)",          group=g_viz)
+show_ote    = input.bool(true,  "OTE zone on active setup",      group=g_viz)
+show_entry  = input.bool(true,  "Entries / Stop / Target",       group=g_viz)
+show_partls = input.bool(true,  "R-ladder partial exits + trail",group=g_viz)
+show_asian  = input.bool(true,  "Asian range (overnight)",       group=g_viz)
+show_midnt  = input.bool(true,  "Midnight 15m range",            group=g_viz)
+show_ndog   = input.bool(true,  "NDOG / NWOG opening gaps",      group=g_viz)
+show_status = input.bool(true,  "Status table (top right)",      group=g_viz)
+
+// ─── Strategy params ─────────────────────────────────────────────────
+g_strat     = "▼ Strategy params"
+fractal_n   = input.int(3,    "Intraday fractal N", minval=2, maxval=10, group=g_strat,
+     tooltip="Bars on each side for swing pivot detection (default 3 = 7-bar fractal)")
+atr_len     = input.int(14,   "ATR length",         minval=5, maxval=50, group=g_strat)
+disp_atr    = input.float(1.0, "Displacement body ≥ N×ATR", step=0.1,    group=g_strat)
+fvg_min_atr = input.float(0.2, "FVG min size ≥ N×ATR",      step=0.05,   group=g_strat)
+sweep_lookback = input.int(60, "Sweep lookback bars",       minval=10,   group=g_strat)
+sweep_pierce_atr = input.float(0.2, "Sweep pierce ≥ N×ATR", step=0.05,   group=g_strat)
+sweep_to_disp_max = input.int(30, "Sweep→displacement max bars",         group=g_strat)
+ote_low_pct = input.float(0.62,  "OTE low %",  step=0.01, group=g_strat)
+ote_mid_pct = input.float(0.705, "OTE mid % (sweet spot)", step=0.005, group=g_strat)
+ote_high_pct = input.float(0.79, "OTE high %", step=0.01, group=g_strat)
+ote_fill_max_bars = input.int(60, "OTE fill timeout (bars)", group=g_strat)
+stop_atr_buf = input.float(1.0, "Stop = sweep ± N×ATR", step=0.1, group=g_strat)
+stop_max_atr = input.float(2.0, "Stop max ≤ N×ATR",     step=0.1, group=g_strat)
+min_rr      = input.float(3.0, "Min R:R",   step=0.1, group=g_strat)
+pd_thresh   = input.float(0.70,"PD discount/premium threshold", step=0.05, group=g_strat,
+     tooltip="LONG only if D1 close pos ≤ thresh; SHORT only if pos ≥ 1−thresh")
+
+// ─── EQL / EQH ────────────────────────────────────────────────────────
+g_eq        = "▼ Equal-Lows / Equal-Highs"
+eq_tol_atr  = input.float(0.5, "EQ tolerance N×ATR", step=0.05, group=g_eq)
+eq_min_touch = input.int(2, "EQ minimum touches", minval=2, group=g_eq)
+
+// ─── R-ladder + trail ────────────────────────────────────────────────
+g_exit      = "▼ R-ladder + Trail"
+enable_ladder = input.bool(true, "Enable R-ladder", group=g_exit)
+r1_target   = input.float(0.5, "T1 R-multiple", step=0.1, group=g_exit)
+r2_target   = input.float(1.5, "T2 R-multiple", step=0.1, group=g_exit)
+r3_target   = input.float(3.0, "T3 R-multiple", step=0.1, group=g_exit)
+r1_share    = input.float(0.33, "T1 share", step=0.01, group=g_exit)
+r2_share    = input.float(0.33, "T2 share", step=0.01, group=g_exit)
+enable_trail = input.bool(true, "Enable chandelier trail on runner", group=g_exit)
+trail_atr_mult = input.float(1.0, "Trail = HH/LL ± N×ATR", step=0.1, group=g_exit)
+max_hold_bars = input.int(240, "Max hold bars (4h on 1m)", group=g_exit)
+
+// ─── Risk ─────────────────────────────────────────────────────────────
+g_risk      = "▼ Risk"
+risk_pct    = input.float(0.005,"Risk per trade (fraction)", step=0.001, group=g_risk)
+max_contracts = input.int(5, "Max contracts", minval=1, group=g_risk)
+max_per_day = input.int(3, "Max trades per day", minval=1, group=g_risk)
+daily_stop_r = input.float(-2.0, "Daily stop R", step=0.5, group=g_risk)
+daily_lock_r = input.float(3.0, "Daily lock R", step=0.5, group=g_risk)
+
+// ─── Time gates ──────────────────────────────────────────────────────
+g_time      = "▼ Time gates"
+enable_kz_gate = input.bool(true, "Require kill zone for entries", group=g_time)
+allow_london_kz = input.bool(true, "Allow London KZ (02:00–05:00 ET)", group=g_time)
+allow_london_sb = input.bool(true, "Allow London Silver Bullet (03:00–04:00)", group=g_time)
+allow_london_close = input.bool(true, "Allow London Close (10:00–12:00)", group=g_time)
+allow_ny_am_kz = input.bool(true, "Allow NY AM KZ (08:30–11:00)", group=g_time)
+allow_ny_am_sb = input.bool(true, "Allow NY AM SB (10:00–11:00)", group=g_time)
+allow_ny_pm_kz = input.bool(true, "Allow NY PM KZ (13:30–16:00)", group=g_time)
+allow_ny_pm_sb = input.bool(true, "Allow NY PM SB (14:00–15:00)", group=g_time)
+enable_hard_cutoff = input.bool(true, "Hard cutoff at 15:55 ET", group=g_time)
+
+// ─── Direction toggles ───────────────────────────────────────────────
+g_dir       = "▼ Direction"
+enable_long  = input.bool(true, "Enable LONG setups", group=g_dir)
+enable_short = input.bool(true, "Enable SHORT setups", group=g_dir)
+require_disc_long = input.bool(true, "LONG only in discount", group=g_dir)
+require_disc_short = input.bool(true, "SHORT only in premium", group=g_dir)
+
+// ─── Reactive entry ──────────────────────────────────────────────────
+g_react     = "▼ Reactive entry"
+enable_react = input.bool(true, "Require engulfing OR micro-MSS in OTE band", group=g_react)
+require_both = input.bool(false, "Require BOTH engulfing AND micro-MSS",      group=g_react)
+
+// ─── Lifecycle / drawing budget ──────────────────────────────────────
+g_life      = "▼ Drawing lifecycle"
+fvg_max_age = input.int(480, "FVG max age (bars before delete)", group=g_life)
+ob_max_age  = input.int(1440, "OB max age",                      group=g_life)
+sweep_keep_bars = input.int(240, "Sweep marker keep (bars)",     group=g_life)
+swing_keep_per_side = input.int(80, "Swing markers kept per side", group=g_life)
+
+
+// =====================================================================
+// 2.  TIME (ET via timezone parameter)
+// =====================================================================
+NY_TZ = "America/New_York"
+et_h  = hour(time, NY_TZ)
+et_m  = minute(time, NY_TZ)
+et_min_of_day = et_h * 60 + et_m
+et_dow        = dayofweek(time, NY_TZ)
+et_date       = "" + str.tostring(year(time, NY_TZ)) + "-" +
+                str.tostring(month(time, NY_TZ)) + "-" +
+                str.tostring(dayofmonth(time, NY_TZ))
+
+f_in_window(int sH, int sM, int eH, int eM) =>
+    s = sH * 60 + sM
+    e = eH * 60 + eM
+    cur = et_min_of_day
+    e == 0 ? cur >= s or cur < (24 * 60) :
+       s <= e ? cur >= s and cur < e : cur >= s or cur < e
+
+// Kill zones (ET)
+in_london_kz       = f_in_window(2, 0, 5, 0)
+in_london_sb       = f_in_window(3, 0, 4, 0)
+in_london_close_kz = f_in_window(10, 0, 12, 0)
+in_ny_am_kz        = f_in_window(8, 30, 11, 0)
+in_ny_am_sb        = f_in_window(10, 0, 11, 0)
+in_ny_pm_kz        = f_in_window(13, 30, 16, 0)
+in_ny_pm_sb        = f_in_window(14, 0, 15, 0)
+in_ny_lunch        = f_in_window(12, 0, 13, 0)
+past_hard_cutoff_v = (et_h * 60 + et_m) >= (15 * 60 + 55)
+
+f_active_kz() =>
+    in_ny_lunch ? "LUNCH" :
+       in_ny_am_sb ? "NY_AM_SB" :
+       in_ny_pm_sb ? "NY_PM_SB" :
+       in_london_sb ? "London_SB" :
+       in_ny_am_kz ? "NY_AM_KZ" :
+       in_ny_pm_kz ? "NY_PM_KZ" :
+       in_london_kz ? "London_KZ" :
+       in_london_close_kz ? "London_Close_KZ" : "—"
+
+active_kz = f_active_kz()
+
+f_kz_allowed(string kz) =>
+    (kz == "London_KZ" and allow_london_kz) or
+       (kz == "London_SB" and allow_london_sb) or
+       (kz == "London_Close_KZ" and allow_london_close) or
+       (kz == "NY_AM_KZ" and allow_ny_am_kz) or
+       (kz == "NY_AM_SB" and allow_ny_am_sb) or
+       (kz == "NY_PM_KZ" and allow_ny_pm_kz) or
+       (kz == "NY_PM_SB" and allow_ny_pm_sb)
+
+in_any_kz_v = (in_london_kz or in_ny_am_kz or in_ny_pm_kz or in_london_close_kz) and not in_ny_lunch
+
+
+// =====================================================================
+// 3.  KILL-ZONE BACKGROUND
+// =====================================================================
+f_kz_color() =>
+    in_ny_lunch ? color.new(color.gray, 92) :
+       in_ny_am_sb ? color.new(color.yellow, 80) :
+       in_ny_pm_sb ? color.new(color.lime, 80) :
+       in_london_sb ? color.new(color.fuchsia, 85) :
+       in_ny_am_kz ? color.new(color.yellow, 92) :
+       in_ny_pm_kz ? color.new(color.lime, 92) :
+       in_london_kz ? color.new(color.aqua, 92) :
+       in_london_close_kz ? color.new(color.orange, 92) : na
+
+bgcolor(show_kz ? f_kz_color() : na, title="Kill Zone")
+bgcolor(show_lunch and in_ny_lunch ? color.new(color.gray, 88) : na, title="NY Lunch")
+
+
+// =====================================================================
+// 4.  ATR
+// =====================================================================
+atr_v = ta.atr(atr_len)
+
+
+// =====================================================================
+// 5.  D1 BIAS via request.security
+// =====================================================================
+// Compute bias on D1: direction of last MSS (close beyond prior swing high/low
+// with body ≥ 1×ATR on D1).  PD zone = position within rolling 20-day swing range.
+
+f_d1_bias() =>
+    // Detect swing on D1 with fractal_n=2 ⇒ ta.pivothigh(2,2) confirmed 2 bars later
+    sh = ta.pivothigh(2, 2)
+    sl = ta.pivotlow(2, 2)
+    var float last_sh = na
+    var float last_sl = na
+    var int last_mss_dir = 0      // +1 bull, -1 bear, 0 none
+    var int last_mss_idx = -999
+    if not na(sh)
+        last_sh := sh
+    if not na(sl)
+        last_sl := sl
+    atr_d = ta.atr(14)
+    body  = math.abs(close - open)
+    // Bull MSS: close > last confirmed SH AND body >= 1×ATR
+    if not na(last_sh) and close > last_sh and body >= 1.0 * atr_d
+        last_mss_dir := 1
+        last_mss_idx := bar_index
+    if not na(last_sl) and close < last_sl and body >= 1.0 * atr_d
+        last_mss_dir := -1
+        last_mss_idx := bar_index
+    // Dealing range: 20-bar rolling high/low (using past 20 D1 bars)
+    dr_high = ta.highest(high, 20)
+    dr_low  = ta.lowest(low,  20)
+    days_since = bar_index - last_mss_idx
+    [last_mss_dir, dr_high, dr_low, days_since]
+
+[d1_mss_raw, d1_dr_high_raw, d1_dr_low_raw, d1_age_raw] =
+    request.security(syminfo.tickerid, "D",
+         f_d1_bias(),
+         lookahead = barmerge.lookahead_off)
+
+// Translate to bias label
+f_bias_str(int dir, int age, float prev_close, float dr_h, float dr_l) =>
+    if dr_h <= dr_l or dir == 0
+        "neutral"
+    else
+        pos = (prev_close - dr_l) / (dr_h - dr_l)
+        eq_band = 0.10
+        in_eq = pos >= 0.5 - eq_band and pos <= 0.5 + eq_band
+        if dir == 0 or (in_eq and age > 5)
+            "neutral"
+        else
+            dir == 1 ? "bull" : "bear"
+
+// Use yesterday's close (frozen at 00:00 ET) — request "D" with close[1]
+prev_d1_close = request.security(syminfo.tickerid, "D", close[1],
+     lookahead = barmerge.lookahead_off)
+d1_bias = f_bias_str(d1_mss_raw, d1_age_raw, prev_d1_close, d1_dr_high_raw, d1_dr_low_raw)
+
+// PD position on D1 (using yesterday's close as canonical "today's bias context")
+d1_pd_pos = d1_dr_high_raw > d1_dr_low_raw ?
+     (close - d1_dr_low_raw) / (d1_dr_high_raw - d1_dr_low_raw) : 0.5
+
+
+// =====================================================================
+// 6.  TYPES
+// =====================================================================
+type FVG
+    int     idx
+    int     dir            // +1 bull, -1 bear
+    float   fvg_low
+    float   fvg_high
+    float   atr_at
+    bool    filled
+    box     bx
+
+type OB
+    int     idx
+    int     dir            // +1 bull, -1 bear
+    float   low_
+    float   high_
+    float   body_ratio
+    float   disp_atr
+    int     disp_idx
+    bool    breaker
+    int     state          // 0 fresh, 1 tested, 2 broken
+    box     bx
+    label   lb
+
+type Pivot
+    int     idx
+    int     side           // +1 high, -1 low
+    float   price
+    label   lb
+
+type EQCluster
+    int     side           // +1 high, -1 low
+    float   level
+    int     touch_count
+    int     most_recent_idx
+    line    ln
+    label   lb
+
+type SweepEv
+    int     idx
+    int     dir            // +1 swept high (BSL), -1 swept low (SSL)
+    float   level
+    string  source
+    label   lb
+    line    ln
+
+type OTESetup
+    bool    active
+    int     direction
+    int     sweep_idx
+    int     disp_idx
+    int     place_idx
+    int     expire_idx
+    float   limit_price
+    float   stop_price
+    float   target_price
+    float   ote_low
+    float   ote_high
+    float   sweep_level
+    float   disp_extreme
+    string  bias
+    string  kz
+    box     ote_bx
+    line    stop_ln
+    line    target_ln
+    line    limit_ln
+    label   info_lb
+
+type ActiveTrade
+    bool    active
+    int     direction      // +1 long, -1 short
+    int     entry_bar
+    float   entry_price
+    float   initial_stop
+    float   stop_price
+    float   target_price
+    float   r_distance     // |entry - initial_stop|
+    int     contracts
+    int     initial_contracts
+    int     partials_done  // 0..3
+    bool    moved_to_be
+    string  bias
+    string  kz
+    line    entry_ln
+    line    stop_ln
+    line    target_ln
+    label   info_lb
+
+type DayState
+    int     trades_today
+    float   pnl_r
+
+
+// =====================================================================
+// 7.  PERSISTENT ARRAYS
+// =====================================================================
+var array<FVG>       fvgs       = array.new<FVG>()
+var array<OB>        obs        = array.new<OB>()
+var array<Pivot>     swings_h   = array.new<Pivot>()
+var array<Pivot>     swings_l   = array.new<Pivot>()
+var array<EQCluster> eq_clusters = array.new<EQCluster>()
+var array<SweepEv>   sweeps     = array.new<SweepEv>()
+var OTESetup ote = OTESetup.new(false, 0, 0, 0, 0, 0,
+     na, na, na, na, na, na, na, "", "",
+     na, na, na, na, na)
+var ActiveTrade tr = ActiveTrade.new(false, 0, 0,
+     na, na, na, na, na, 0, 0, 0, false, "", "",
+     na, na, na, na)
+var int trades_today = 0
+var float pnl_r_today = 0.0
+var int last_day_id = -1
+
+
+// =====================================================================
+// 8.  PIVOT DETECTION (intraday)
+// =====================================================================
+piv_h_val = ta.pivothigh(fractal_n, fractal_n)
+piv_l_val = ta.pivotlow(fractal_n, fractal_n)
+piv_h_idx = bar_index - fractal_n
+piv_l_idx = bar_index - fractal_n
+
+if not na(piv_h_val)
+    lb = show_swings ? label.new(piv_h_idx, piv_h_val,
+        text="▲", style=label.style_label_down,
+        color=color.new(color.red, 80), textcolor=color.red, size=size.tiny) : na
+    swings_h.push(Pivot.new(piv_h_idx, 1, piv_h_val, lb))
+    while swings_h.size() > swing_keep_per_side
+        old = swings_h.shift()
+        if not na(old.lb)
+            label.delete(old.lb)
+
+if not na(piv_l_val)
+    lb = show_swings ? label.new(piv_l_idx, piv_l_val,
+        text="▼", style=label.style_label_up,
+        color=color.new(color.green, 80), textcolor=color.green, size=size.tiny) : na
+    swings_l.push(Pivot.new(piv_l_idx, -1, piv_l_val, lb))
+    while swings_l.size() > swing_keep_per_side
+        old = swings_l.shift()
+        if not na(old.lb)
+            label.delete(old.lb)
+
+
+// =====================================================================
+// 9.  EQUAL LOWS / HIGHS CLUSTER (re-eval each bar — cheap, bounded array)
+// =====================================================================
+// Cluster the most recent N pivots within tolerance.  We rebuild on each new pivot.
+f_rebuild_eq_clusters() =>
+    // delete prior
+    for i = 0 to eq_clusters.size() - 1
+        ec = eq_clusters.get(i)
+        if not na(ec.ln)
+            line.delete(ec.ln)
+        if not na(ec.lb)
+            label.delete(ec.lb)
+    eq_clusters.clear()
+    if na(atr_v) or atr_v <= 0
+        eq_clusters
+    else
+        tol = eq_tol_atr * atr_v
+        // Lows
+        used_l = array.new_bool(swings_l.size(), false)
+        for i = 0 to swings_l.size() - 1
+            if used_l.get(i)
+                continue
+            anchor = swings_l.get(i)
+            cluster_idxs = array.new_int()
+            cluster_idxs.push(i)
+            for j = i + 1 to swings_l.size() - 1
+                if used_l.get(j)
+                    continue
+                other = swings_l.get(j)
+                if math.abs(other.price - anchor.price) <= tol
+                    cluster_idxs.push(j)
+            if cluster_idxs.size() >= eq_min_touch
+                lvl = 0.0
+                most_recent = 0
+                for k = 0 to cluster_idxs.size() - 1
+                    p = swings_l.get(cluster_idxs.get(k))
+                    lvl += p.price
+                    most_recent := math.max(most_recent, p.idx)
+                    used_l.set(cluster_idxs.get(k), true)
+                lvl /= cluster_idxs.size()
+                first_idx = swings_l.get(cluster_idxs.get(0)).idx
+                ln = show_eq ? line.new(first_idx, lvl, bar_index + 5, lvl,
+                    color=color.new(color.fuchsia, 30),
+                    style=line.style_dashed, width=2) : na
+                lb = show_eq ? label.new(bar_index + 5, lvl,
+                    text="EQL×" + str.tostring(cluster_idxs.size()),
+                    style=label.style_label_left, size=size.small,
+                    color=color.new(color.fuchsia, 70),
+                    textcolor=color.fuchsia) : na
+                eq_clusters.push(EQCluster.new(-1, lvl, cluster_idxs.size(), most_recent, ln, lb))
+        // Highs
+        used_h = array.new_bool(swings_h.size(), false)
+        for i = 0 to swings_h.size() - 1
+            if used_h.get(i)
+                continue
+            anchor = swings_h.get(i)
+            cluster_idxs = array.new_int()
+            cluster_idxs.push(i)
+            for j = i + 1 to swings_h.size() - 1
+                if used_h.get(j)
+                    continue
+                other = swings_h.get(j)
+                if math.abs(other.price - anchor.price) <= tol
+                    cluster_idxs.push(j)
+            if cluster_idxs.size() >= eq_min_touch
+                lvl = 0.0
+                most_recent = 0
+                for k = 0 to cluster_idxs.size() - 1
+                    p = swings_h.get(cluster_idxs.get(k))
+                    lvl += p.price
+                    most_recent := math.max(most_recent, p.idx)
+                    used_h.set(cluster_idxs.get(k), true)
+                lvl /= cluster_idxs.size()
+                first_idx = swings_h.get(cluster_idxs.get(0)).idx
+                ln = show_eq ? line.new(first_idx, lvl, bar_index + 5, lvl,
+                    color=color.new(color.aqua, 30),
+                    style=line.style_dashed, width=2) : na
+                lb = show_eq ? label.new(bar_index + 5, lvl,
+                    text="EQH×" + str.tostring(cluster_idxs.size()),
+                    style=label.style_label_left, size=size.small,
+                    color=color.new(color.aqua, 70),
+                    textcolor=color.aqua) : na
+                eq_clusters.push(EQCluster.new(1, lvl, cluster_idxs.size(), most_recent, ln, lb))
+        eq_clusters
+
+// Rebuild only when a new pivot was just confirmed (cheap)
+new_pivot = not na(piv_h_val) or not na(piv_l_val)
+if new_pivot
+    f_rebuild_eq_clusters()
+
+
+// =====================================================================
+// 10. FAIR VALUE GAPS (3-bar)
+// =====================================================================
+// Bullish FVG: low[0] > high[2]  (bar t-1 = current displacement; t-2 wick high vs t low)
+// We test on confirmed bar — when high[2] < low[0], bar at index-1 is the displacement
+// and bar-2 is the wick.
+
+if barstate.isconfirmed
+    if not na(atr_v) and atr_v > 0
+        // Bullish 3-bar FVG (using offsets: low[0] = current low, high[2] = high two bars ago)
+        if low > high[2]
+            fvg_size = low - high[2]
+            if fvg_size >= fvg_min_atr * atr_v
+                bx = show_fvg ? box.new(bar_index - 2, low, bar_index, high[2],
+                    border_color = color.new(color.green, 50),
+                    bgcolor = color.new(color.green, 85),
+                    border_width = 1) : na
+                fvgs.push(FVG.new(bar_index - 1, 1, high[2], low, atr_v, false, bx))
+        // Bearish 3-bar FVG: high[0] < low[2]
+        if high < low[2]
+            fvg_size = low[2] - high
+            if fvg_size >= fvg_min_atr * atr_v
+                bx = show_fvg ? box.new(bar_index - 2, low[2], bar_index, high,
+                    border_color = color.new(color.red, 50),
+                    bgcolor = color.new(color.red, 85),
+                    border_width = 1) : na
+                fvgs.push(FVG.new(bar_index - 1, -1, high, low[2], atr_v, false, bx))
+
+// Mark FVG filled when price crosses through; extend boxes; delete old / filled
+if fvgs.size() > 0
+    i = 0
+    while i < fvgs.size()
+        f = fvgs.get(i)
+        age = bar_index - f.idx
+        // Filled?
+        if not f.filled
+            if f.dir == 1 and low <= f.fvg_low
+                f.filled := true
+                if not na(f.bx)
+                    f.bx.set_bgcolor(color.new(color.gray, 90))
+                    f.bx.set_border_color(color.new(color.gray, 60))
+            if f.dir == -1 and high >= f.fvg_high
+                f.filled := true
+                if not na(f.bx)
+                    f.bx.set_bgcolor(color.new(color.gray, 90))
+                    f.bx.set_border_color(color.new(color.gray, 60))
+        // Extend right edge while fresh
+        if not f.filled and not na(f.bx)
+            f.bx.set_right(bar_index + 1)
+        // Cull old
+        if age > fvg_max_age or f.filled and age > 60
+            if not na(f.bx)
+                box.delete(f.bx)
+            fvgs.remove(i)
+        else
+            i += 1
+
+
+// =====================================================================
+// 11. ORDER BLOCKS + BREAKERS
+// =====================================================================
+// Bullish OB: bar t bearish (close<open) AND bar t+1 (or t+2) is bullish displacement
+// (body ≥ 1×ATR + close > high[t]).  Zone = [low[t], high[t]].
+
+if barstate.isconfirmed and bar_index >= 4 and not na(atr_v) and atr_v > 0
+    // Check bar (bar_index - 1) as candidate OB, bar_index as candidate displacement
+    ob_idx = bar_index - 1
+    disp_open = open
+    disp_close = close
+    disp_high = high
+    disp_low = low
+    disp_body = math.abs(disp_close - disp_open)
+
+    ob_open = open[1]
+    ob_close = close[1]
+    ob_high = high[1]
+    ob_low = low[1]
+    ob_body = math.abs(ob_close - ob_open)
+    ob_range = ob_high - ob_low
+    body_ratio = ob_range > 0 ? ob_body / ob_range : 0.0
+
+    is_disp_bull = disp_close > disp_open and disp_body >= disp_atr * atr_v and disp_close > ob_high
+    is_disp_bear = disp_close < disp_open and disp_body >= disp_atr * atr_v and disp_close < ob_low
+
+    is_ob_bear = ob_close < ob_open
+    is_ob_bull = ob_close > ob_open
+
+    if is_ob_bear and is_disp_bull and (body_ratio >= 0.3 or ob_body >= 0.3 * atr_v)
+        bx = show_ob ? box.new(ob_idx, ob_high, bar_index + 30, ob_low,
+            border_color = color.new(color.blue, 30),
+            bgcolor = color.new(color.blue, 88),
+            border_width = 1) : na
+        lb = show_ob ? label.new(bar_index + 30, ob_low,
+            text="OB↑", style=label.style_label_left,
+            color=color.new(color.blue, 60), textcolor=color.blue,
+            size=size.tiny) : na
+        obs.push(OB.new(ob_idx, 1, ob_low, ob_high, body_ratio, atr_v, bar_index, false, 0, bx, lb))
+
+    if is_ob_bull and is_disp_bear and (body_ratio >= 0.3 or ob_body >= 0.3 * atr_v)
+        bx = show_ob ? box.new(ob_idx, ob_high, bar_index + 30, ob_low,
+            border_color = color.new(color.orange, 30),
+            bgcolor = color.new(color.orange, 88),
+            border_width = 1) : na
+        lb = show_ob ? label.new(bar_index + 30, ob_high,
+            text="OB↓", style=label.style_label_left,
+            color=color.new(color.orange, 60), textcolor=color.orange,
+            size=size.tiny) : na
+        obs.push(OB.new(ob_idx, -1, ob_low, ob_high, body_ratio, atr_v, bar_index, false, 0, bx, lb))
+
+// Update OB states: tested / broken / promote-to-breaker
+if obs.size() > 0
+    i = 0
+    while i < obs.size()
+        o = obs.get(i)
+        age = bar_index - o.idx
+        if o.state == 0  // fresh
+            if o.dir == 1
+                if low <= o.high_ and low >= o.low_
+                    o.state := 1
+                if close < o.low_
+                    o.state := 2
+                    // Promote to breaker (bull OB broke down → bearish resistance)
+                    if not o.breaker
+                        o.breaker := true
+                        if show_brk and not na(o.bx)
+                            o.bx.set_bgcolor(color.new(color.purple, 75))
+                            o.bx.set_border_color(color.new(color.purple, 30))
+                            o.bx.set_border_width(2)
+                        if show_brk and not na(o.lb)
+                            o.lb.set_text("BPR↓")
+                            o.lb.set_textcolor(color.purple)
+            else
+                if high >= o.low_ and high <= o.high_
+                    o.state := 1
+                if close > o.high_
+                    o.state := 2
+                    if not o.breaker
+                        o.breaker := true
+                        if show_brk and not na(o.bx)
+                            o.bx.set_bgcolor(color.new(color.purple, 75))
+                            o.bx.set_border_color(color.new(color.purple, 30))
+                            o.bx.set_border_width(2)
+                        if show_brk and not na(o.lb)
+                            o.lb.set_text("BPR↑")
+                            o.lb.set_textcolor(color.purple)
+        if not na(o.bx) and o.state != 2
+            o.bx.set_right(bar_index + 30)
+        if age > ob_max_age or (o.state == 2 and age > ob_max_age / 2)
+            if not na(o.bx)
+                box.delete(o.bx)
+            if not na(o.lb)
+                label.delete(o.lb)
+            obs.remove(i)
+        else
+            i += 1
+
+
+// =====================================================================
+// 12. SWEEP DETECTION (pierce + reclaim)
+// =====================================================================
+// On confirmed bar: did current bar pierce a recent swing low/high or EQ cluster
+// AND close back across the level?
+
+f_check_sweep_low(float lvl, int level_idx, string src) =>
+    if na(atr_v) or atr_v <= 0
+        false
+    else
+        pierce_buf = sweep_pierce_atr * atr_v
+        // Find any bar in (level_idx, bar_index] that pierced: low < lvl - pierce_buf
+        pierced = false
+        for k = level_idx + 1 to bar_index
+            if low[bar_index - k] < lvl - pierce_buf
+                pierced := true
+                break
+        // Reclaim by current close
+        pierced and close > lvl
+
+f_check_sweep_high(float lvl, int level_idx, string src) =>
+    if na(atr_v) or atr_v <= 0
+        false
+    else
+        pierce_buf = sweep_pierce_atr * atr_v
+        pierced = false
+        for k = level_idx + 1 to bar_index
+            if high[bar_index - k] > lvl + pierce_buf
+                pierced := true
+                break
+        pierced and close < lvl
+
+// Single-pass: find best sweep in lookback (EQ priority then single swing)
+f_detect_sweep_long() =>
+    // Returns [hit?, level, src, level_idx]
+    var float best_lvl = na
+    var string best_src = ""
+    var int best_idx = -1
+    best_lvl := na
+    best_src := ""
+    best_idx := -1
+    // EQ priority
+    for i = 0 to eq_clusters.size() - 1
+        ec = eq_clusters.get(i)
+        if ec.side == -1 and bar_index - ec.most_recent_idx <= sweep_lookback and ec.most_recent_idx < bar_index
+            if f_check_sweep_low(ec.level, ec.most_recent_idx, "EQL×" + str.tostring(ec.touch_count))
+                if best_idx < ec.most_recent_idx
+                    best_lvl := ec.level
+                    best_src := "EQL×" + str.tostring(ec.touch_count)
+                    best_idx := ec.most_recent_idx
+    if best_idx >= 0
+        [true, best_lvl, best_src, best_idx]
+    else
+        // Fallback single swing low
+        for j = swings_l.size() - 1 to 0
+            sw = swings_l.get(j)
+            if bar_index - sw.idx > sweep_lookback
+                break
+            if sw.idx < bar_index
+                if f_check_sweep_low(sw.price, sw.idx, "single_low")
+                    best_lvl := sw.price
+                    best_src := "single_low"
+                    best_idx := sw.idx
+                    break
+        best_idx >= 0 ? [true, best_lvl, best_src, best_idx] : [false, na, "", -1]
+
+f_detect_sweep_short() =>
+    var float best_lvl = na
+    var string best_src = ""
+    var int best_idx = -1
+    best_lvl := na
+    best_src := ""
+    best_idx := -1
+    for i = 0 to eq_clusters.size() - 1
+        ec = eq_clusters.get(i)
+        if ec.side == 1 and bar_index - ec.most_recent_idx <= sweep_lookback and ec.most_recent_idx < bar_index
+            if f_check_sweep_high(ec.level, ec.most_recent_idx, "EQH×" + str.tostring(ec.touch_count))
+                if best_idx < ec.most_recent_idx
+                    best_lvl := ec.level
+                    best_src := "EQH×" + str.tostring(ec.touch_count)
+                    best_idx := ec.most_recent_idx
+    if best_idx >= 0
+        [true, best_lvl, best_src, best_idx]
+    else
+        for j = swings_h.size() - 1 to 0
+            sw = swings_h.get(j)
+            if bar_index - sw.idx > sweep_lookback
+                break
+            if sw.idx < bar_index
+                if f_check_sweep_high(sw.price, sw.idx, "single_high")
+                    best_lvl := sw.price
+                    best_src := "single_high"
+                    best_idx := sw.idx
+                    break
+        best_idx >= 0 ? [true, best_lvl, best_src, best_idx] : [false, na, "", -1]
+
+
+// =====================================================================
+// 13. DISPLACEMENT after sweep (look back N bars from current)
+// =====================================================================
+f_disp_long_recent(int sweep_idx) =>
+    // Scan bars (sweep_idx, bar_index] for bullish displacement leaving 3-bar bullish FVG
+    var int   d_idx = -1
+    var float d_high = na
+    var float d_low = na
+    var float d_open = na
+    var float d_close = na
+    var float fvg_low = na
+    var float fvg_high = na
+    var float d_atr = na
+    d_idx := -1
+    if not na(atr_v) and atr_v > 0
+        for k = sweep_idx + 1 to bar_index - 1
+            if k - 2 < 0 or k + 1 > bar_index
+                continue
+            offset_t = bar_index - k
+            if offset_t < 1
+                continue
+            o_t  = open[offset_t]
+            c_t  = close[offset_t]
+            h_t  = high[offset_t]
+            l_t  = low[offset_t]
+            h_tm2 = high[offset_t + 2]
+            l_tp1 = low[offset_t - 1]
+            atr_at = ta.atr(atr_len)[offset_t + 1]
+            if na(atr_at) or atr_at <= 0
+                continue
+            body = math.abs(c_t - o_t)
+            if body < disp_atr * atr_at
+                continue
+            if c_t <= o_t
+                continue
+            if l_tp1 <= h_tm2
+                continue
+            fsz = l_tp1 - h_tm2
+            if fsz < fvg_min_atr * atr_at
+                continue
+            d_idx := k
+            d_open := o_t
+            d_close := c_t
+            d_high := h_t
+            d_low := l_t
+            fvg_low := h_tm2
+            fvg_high := l_tp1
+            d_atr := atr_at
+            break
+    [d_idx, d_open, d_close, d_high, d_low, fvg_low, fvg_high, d_atr]
+
+f_disp_short_recent(int sweep_idx) =>
+    var int   d_idx = -1
+    var float d_high = na
+    var float d_low = na
+    var float d_open = na
+    var float d_close = na
+    var float fvg_low = na
+    var float fvg_high = na
+    var float d_atr = na
+    d_idx := -1
+    if not na(atr_v) and atr_v > 0
+        for k = sweep_idx + 1 to bar_index - 1
+            if k - 2 < 0 or k + 1 > bar_index
+                continue
+            offset_t = bar_index - k
+            if offset_t < 1
+                continue
+            o_t = open[offset_t]
+            c_t = close[offset_t]
+            h_t = high[offset_t]
+            l_t = low[offset_t]
+            l_tm2 = low[offset_t + 2]
+            h_tp1 = high[offset_t - 1]
+            atr_at = ta.atr(atr_len)[offset_t + 1]
+            if na(atr_at) or atr_at <= 0
+                continue
+            body = math.abs(c_t - o_t)
+            if body < disp_atr * atr_at
+                continue
+            if c_t >= o_t
+                continue
+            if h_tp1 >= l_tm2
+                continue
+            fsz = l_tm2 - h_tp1
+            if fsz < fvg_min_atr * atr_at
+                continue
+            d_idx := k
+            d_open := o_t
+            d_close := c_t
+            d_high := h_t
+            d_low := l_t
+            fvg_low := h_tp1
+            fvg_high := l_tm2
+            d_atr := atr_at
+            break
+    [d_idx, d_open, d_close, d_high, d_low, fvg_low, fvg_high, d_atr]
+
+
+// =====================================================================
+// 14. DISPLACEMENT BAR HIGHLIGHT (visual)
+// =====================================================================
+disp_bull_now = barstate.isconfirmed and not na(atr_v) and atr_v > 0 and
+     close > open and math.abs(close - open) >= disp_atr * atr_v and
+     bar_index >= 2 and low > high[2]
+disp_bear_now = barstate.isconfirmed and not na(atr_v) and atr_v > 0 and
+     close < open and math.abs(close - open) >= disp_atr * atr_v and
+     bar_index >= 2 and high < low[2]
+bgcolor(show_disp and disp_bull_now ? color.new(color.lime, 75) : na, title="Bull Displacement")
+bgcolor(show_disp and disp_bear_now ? color.new(color.red, 75) : na, title="Bear Displacement")
+
+
+// =====================================================================
+// 15. ASIAN RANGE + MIDNIGHT 15m  (per ET trading day)
+// =====================================================================
+// Asian: 20:00-23:59 ET (prev cal day) + 00:00 ET (today's start) → today's range
+// Midnight: 00:00-00:14 ET → today
+// Trading day key = ET calendar date
+
+today_id  = year(time, NY_TZ) * 10000 + month(time, NY_TZ) * 100 + dayofmonth(time, NY_TZ)
+new_day = today_id != last_day_id
+if new_day
+    last_day_id := today_id
+    trades_today := 0
+    pnl_r_today := 0.0
+
+in_asian   = (et_h >= 20) or (et_h == 0 and et_m == 0)  // 20:00–23:59 + 00:00 boundary
+in_midnt15 = et_h == 0 and et_m < 15
+
+var float asian_h = na
+var float asian_l = na
+var int asian_start_bar = na
+var box asian_box = na
+var float midnt_h = na
+var float midnt_l = na
+var int midnt_start_bar = na
+var box midnt_box = na
+
+// Asian range builds up; box drawn each bar inside session
+if in_asian
+    if na(asian_h) or new_day
+        asian_h := high
+        asian_l := low
+        asian_start_bar := bar_index
+        if not na(asian_box)
+            box.delete(asian_box)
+        asian_box := show_asian ? box.new(bar_index, high, bar_index, low,
+            border_color = color.new(color.gold, 40),
+            bgcolor = color.new(color.gold, 90), border_width = 1) : na
+    asian_h := math.max(asian_h, high)
+    asian_l := math.min(asian_l, low)
+    if not na(asian_box)
+        asian_box.set_top(asian_h)
+        asian_box.set_bottom(asian_l)
+        asian_box.set_right(bar_index)
+
+if in_midnt15
+    if na(midnt_h) or new_day
+        midnt_h := high
+        midnt_l := low
+        midnt_start_bar := bar_index
+        if not na(midnt_box)
+            box.delete(midnt_box)
+        midnt_box := show_midnt ? box.new(bar_index, high, bar_index, low,
+            border_color = color.new(color.silver, 40),
+            bgcolor = color.new(color.silver, 92), border_width = 1) : na
+    midnt_h := math.max(midnt_h, high)
+    midnt_l := math.min(midnt_l, low)
+    if not na(midnt_box)
+        midnt_box.set_top(midnt_h)
+        midnt_box.set_bottom(midnt_l)
+        midnt_box.set_right(bar_index)
+
+
+// =====================================================================
+// 16. NDOG / NWOG (daily session opening gap)
+// =====================================================================
+// Approximate: when ET hour == 18 (CME globex resume in ET ≈ 18:00) and we have
+// access to prior calendar-day close.
+var float prev_day_close = na
+var int prev_day_bar = na
+var box ndog_box = na
+
+is_session_open = et_h == 18 and et_m == 0
+if is_session_open and not na(prev_day_close)
+    new_open = close
+    diff = new_open - prev_day_close
+    if math.abs(diff) > syminfo.mintick * 4
+        gap_low = math.min(prev_day_close, new_open)
+        gap_high = math.max(prev_day_close, new_open)
+        weekday_gap = et_dow == dayofweek.sunday or et_dow == dayofweek.monday
+        kind = weekday_gap ? "NWOG" : "NDOG"
+        if show_ndog
+            bx = box.new(bar_index, gap_high, bar_index + 240, gap_low,
+                border_color = color.new(color.fuchsia, 30),
+                bgcolor = color.new(color.fuchsia, 88), border_width = 1)
+            label.new(bar_index + 240, (gap_high + gap_low) / 2, text=kind,
+                style = label.style_label_left, size = size.tiny,
+                color = color.new(color.fuchsia, 70), textcolor = color.fuchsia)
+
+// Update prev day close at end of each day
+if new_day and not na(close[1])
+    prev_day_close := close[1]
+    prev_day_bar := bar_index - 1
+
+
+// =====================================================================
+// 17. STATE MACHINE & ENTRY LOGIC
+// =====================================================================
+// Run on confirmed bar.
+// Decision tree:
+//   1. If in trade → manage
+//   2. Else if OTE pending → check fill
+//   3. Else if eligible (KZ + bias + daily limits OK) → look for sweep+disp → arm OTE
+
+f_position_size(float capital, float risk_pct_, float stop_dist_pts) =>
+    if stop_dist_pts <= 0
+        0
+    else
+        // NQ tick = 0.25, $5 tick value
+        loss_per_ct = (stop_dist_pts / syminfo.mintick) * 5.0
+        loss_per_ct <= 0 ? 0 : math.max(0, math.min(max_contracts, int((capital * risk_pct_) / loss_per_ct)))
+
+f_clear_ote() =>
+    if not na(ote.ote_bx)
+        box.delete(ote.ote_bx)
+    if not na(ote.stop_ln)
+        line.delete(ote.stop_ln)
+    if not na(ote.target_ln)
+        line.delete(ote.target_ln)
+    if not na(ote.limit_ln)
+        line.delete(ote.limit_ln)
+    if not na(ote.info_lb)
+        label.delete(ote.info_lb)
+    ote.active := false
+    ote.direction := 0
+
+f_clear_trade() =>
+    if not na(tr.entry_ln)
+        line.delete(tr.entry_ln)
+    if not na(tr.stop_ln)
+        line.delete(tr.stop_ln)
+    if not na(tr.target_ln)
+        line.delete(tr.target_ln)
+    if not na(tr.info_lb)
+        label.delete(tr.info_lb)
+    tr.active := false
+
+f_engulfing_bull() =>
+    close[1] < open[1] and close > open and close > open[1]
+
+f_engulfing_bear() =>
+    close[1] > open[1] and close < open and close < open[1]
+
+f_micro_mss_bull() =>
+    close > ta.highest(high, 5)[1]
+
+f_micro_mss_bear() =>
+    close < ta.lowest(low, 5)[1]
+
+f_find_target_long(float entry, float stop) =>
+    risk = entry - stop
+    if risk <= 0
+        [na, ""]
+    else
+        min_t = entry + min_rr * risk
+        var float best = na
+        var string lbl = ""
+        best := na
+        lbl := ""
+        // Asian high
+        if not na(asian_h) and asian_h > entry and asian_h >= min_t
+            if na(best) or asian_h < best
+                best := asian_h
+                lbl := "asian_high"
+        // Midnight high
+        if not na(midnt_h) and midnt_h > entry and midnt_h >= min_t
+            if na(best) or midnt_h < best
+                best := midnt_h
+                lbl := "midnt_high"
+        // D1 dealing range high
+        if not na(d1_dr_high_raw) and d1_dr_high_raw > entry and d1_dr_high_raw >= min_t
+            if na(best) or d1_dr_high_raw < best
+                best := d1_dr_high_raw
+                lbl := "d1_dr_high"
+        // Recent swing high (last 60 bars)
+        rsh = ta.highest(high, 60)[1]
+        if not na(rsh) and rsh > entry and rsh >= min_t
+            if na(best) or rsh < best
+                best := rsh
+                lbl := "recent_swing_high"
+        [best, lbl]
+
+f_find_target_short(float entry, float stop) =>
+    risk = stop - entry
+    if risk <= 0
+        [na, ""]
+    else
+        min_t = entry - min_rr * risk
+        var float best = na
+        var string lbl = ""
+        best := na
+        lbl := ""
+        if not na(asian_l) and asian_l < entry and asian_l <= min_t
+            if na(best) or asian_l > best
+                best := asian_l
+                lbl := "asian_low"
+        if not na(midnt_l) and midnt_l < entry and midnt_l <= min_t
+            if na(best) or midnt_l > best
+                best := midnt_l
+                lbl := "midnt_low"
+        if not na(d1_dr_low_raw) and d1_dr_low_raw < entry and d1_dr_low_raw <= min_t
+            if na(best) or d1_dr_low_raw > best
+                best := d1_dr_low_raw
+                lbl := "d1_dr_low"
+        rsl = ta.lowest(low, 60)[1]
+        if not na(rsl) and rsl < entry and rsl <= min_t
+            if na(best) or rsl > best
+                best := rsl
+                lbl := "recent_swing_low"
+        [best, lbl]
+
+
+// ---------- TRADE MANAGEMENT ----------
+if tr.active and barstate.isconfirmed
+    d = tr.direction
+    bars_in = bar_index - tr.entry_bar
+
+    // Hard cutoff
+    if enable_hard_cutoff and past_hard_cutoff_v
+        strategy.close("ICT", comment="hard_cutoff")
+        f_clear_trade()
+
+    // Max hold
+    if tr.active and bars_in >= max_hold_bars
+        strategy.close("ICT", comment="max_hold")
+        f_clear_trade()
+
+    if tr.active
+        // R-ladder partials
+        if enable_ladder
+            R = tr.r_distance
+            // T1 (0.5R)
+            if tr.partials_done == 0
+                t1_px = tr.entry_price + d * r1_target * R
+                t1_hit = d == 1 ? high >= t1_px : low <= t1_px
+                if t1_hit
+                    qty1 = math.max(1, int(math.round(tr.initial_contracts * r1_share)))
+                    qty1 := math.min(qty1, tr.contracts)
+                    strategy.close("ICT", qty=qty1, comment="T1_0.5R")
+                    tr.contracts := tr.contracts - qty1
+                    tr.partials_done := 1
+                    tr.stop_price := tr.entry_price  // BE
+                    tr.moved_to_be := true
+                    if show_partls
+                        label.new(bar_index, t1_px, text="T1",
+                            style=label.style_label_down, size=size.tiny,
+                            color=color.new(color.green, 50), textcolor=color.white)
+            // T2 (1.5R)
+            if tr.partials_done == 1 and tr.contracts > 0
+                t2_px = tr.entry_price + d * r2_target * R
+                t2_hit = d == 1 ? high >= t2_px : low <= t2_px
+                if t2_hit
+                    qty2 = math.max(1, int(math.round(tr.initial_contracts * r2_share)))
+                    qty2 := math.min(qty2, tr.contracts)
+                    strategy.close("ICT", qty=qty2, comment="T2_1.5R")
+                    tr.contracts := tr.contracts - qty2
+                    tr.partials_done := 2
+                    if show_partls
+                        label.new(bar_index, t2_px, text="T2",
+                            style=label.style_label_down, size=size.tiny,
+                            color=color.new(color.green, 30), textcolor=color.white)
+            // T3 (3R)
+            if tr.partials_done == 2 and tr.contracts > 0
+                t3_px = tr.entry_price + d * r3_target * R
+                t3_hit = d == 1 ? high >= t3_px : low <= t3_px
+                if t3_hit
+                    strategy.close("ICT", comment="T3_3R")
+                    tr.partials_done := 3
+                    if show_partls
+                        label.new(bar_index, t3_px, text="T3",
+                            style=label.style_label_down, size=size.tiny,
+                            color=color.new(color.green, 0), textcolor=color.white)
+                    f_clear_trade()
+        else
+            // Single TP
+            tp_hit = d == 1 ? high >= tr.target_price : low <= tr.target_price
+            if tp_hit
+                strategy.close("ICT", comment="TP")
+                f_clear_trade()
+
+    // Chandelier trail (after first partial)
+    if tr.active and enable_trail and tr.partials_done >= 1
+        if d == 1
+            hh = ta.highest(high, math.min(60, math.max(1, bars_in)))
+            new_stop = hh - trail_atr_mult * atr_v
+            if new_stop > tr.stop_price
+                tr.stop_price := new_stop
+        else
+            ll = ta.lowest(low, math.min(60, math.max(1, bars_in)))
+            new_stop = ll + trail_atr_mult * atr_v
+            if new_stop < tr.stop_price
+                tr.stop_price := new_stop
+
+    // Stop hit?
+    if tr.active
+        s_hit = (tr.direction == 1 ? low <= tr.stop_price : high >= tr.stop_price)
+        if s_hit
+            strategy.close("ICT", comment=tr.moved_to_be ? "BE_or_trail" : "stop")
+            // Update daily R approx
+            pnl_r_today := pnl_r_today + (tr.moved_to_be ? 0.0 : -1.0)
+            f_clear_trade()
+
+    // Update visual lines
+    if tr.active
+        if not na(tr.stop_ln)
+            tr.stop_ln.set_x2(bar_index + 5)
+            tr.stop_ln.set_y2(tr.stop_price)
+            tr.stop_ln.set_y1(tr.stop_price)
+        if not na(tr.target_ln)
+            tr.target_ln.set_x2(bar_index + 5)
+        if not na(tr.entry_ln)
+            tr.entry_ln.set_x2(bar_index + 5)
+
+
+// ---------- OTE PENDING: check fill ----------
+if not tr.active and ote.active and barstate.isconfirmed
+    // Expire?
+    if bar_index >= ote.expire_idx
+        f_clear_ote()
+    else
+        // Fill check: bar penetrates limit price
+        in_band = low <= ote.ote_high and high >= ote.ote_low
+        confirm_pass = true
+        if enable_react and in_band
+            engulf = ote.direction == 1 ? f_engulfing_bull() : f_engulfing_bear()
+            mss    = ote.direction == 1 ? f_micro_mss_bull() : f_micro_mss_bear()
+            confirm_pass := require_both ? (engulf and mss) : (engulf or mss)
+        fill_hit = low <= ote.limit_price and high >= ote.limit_price
+        if fill_hit and confirm_pass
+            // Place strategy entry
+            equity = strategy.equity
+            stop_dist = math.abs(ote.limit_price - ote.stop_price)
+            qty = f_position_size(equity, risk_pct, stop_dist)
+            if qty >= 1
+                if ote.direction == 1
+                    strategy.entry("ICT", strategy.long, qty=qty, limit=ote.limit_price)
+                else
+                    strategy.entry("ICT", strategy.short, qty=qty, limit=ote.limit_price)
+                tr.active := true
+                tr.direction := ote.direction
+                tr.entry_bar := bar_index
+                tr.entry_price := ote.limit_price
+                tr.initial_stop := ote.stop_price
+                tr.stop_price := ote.stop_price
+                tr.target_price := ote.target_price
+                tr.r_distance := stop_dist
+                tr.contracts := qty
+                tr.initial_contracts := qty
+                tr.partials_done := 0
+                tr.moved_to_be := false
+                tr.bias := ote.bias
+                tr.kz := ote.kz
+                if show_entry
+                    arrow_color = ote.direction == 1 ? color.new(color.green, 0) : color.new(color.red, 0)
+                    arrow_text  = ote.direction == 1 ? "▶ LONG" : "▶ SHORT"
+                    tr.info_lb := label.new(bar_index, ote.limit_price,
+                        text=arrow_text + "\n" + str.tostring(qty) + "× @ " + str.tostring(ote.limit_price, "#.##"),
+                        style=ote.direction == 1 ? label.style_label_up : label.style_label_down,
+                        color=arrow_color, textcolor=color.white, size=size.small)
+                    tr.entry_ln := line.new(bar_index, ote.limit_price, bar_index + 5, ote.limit_price,
+                        color=color.white, style=line.style_solid, width=2)
+                    tr.stop_ln := line.new(bar_index, ote.stop_price, bar_index + 5, ote.stop_price,
+                        color=color.red, style=line.style_dashed, width=2)
+                    tr.target_ln := line.new(bar_index, ote.target_price, bar_index + 5, ote.target_price,
+                        color=color.green, style=line.style_dashed, width=2)
+                trades_today := trades_today + 1
+                f_clear_ote()
+
+
+// ---------- IDLE: scan for new setup ----------
+can_arm = not tr.active and not ote.active and barstate.isconfirmed
+can_arm := can_arm and (not enable_kz_gate or in_any_kz_v)
+can_arm := can_arm and (not enable_hard_cutoff or not past_hard_cutoff_v)
+can_arm := can_arm and (not enable_kz_gate or f_kz_allowed(active_kz))
+can_arm := can_arm and trades_today < max_per_day
+can_arm := can_arm and pnl_r_today > daily_stop_r
+can_arm := can_arm and pnl_r_today < daily_lock_r
+can_arm := can_arm and not na(atr_v) and atr_v > 0
+
+if can_arm and d1_bias != "neutral"
+    direction_int = d1_bias == "bull" ? 1 : -1
+    long_ok  = direction_int == 1 and enable_long
+    short_ok = direction_int == -1 and enable_short
+    // PD gate
+    pd_ok = true
+    if direction_int == 1 and require_disc_long and not na(d1_pd_pos)
+        pd_ok := d1_pd_pos <= pd_thresh
+    if direction_int == -1 and require_disc_short and not na(d1_pd_pos)
+        pd_ok := d1_pd_pos >= 1.0 - pd_thresh
+
+    if (long_ok or short_ok) and pd_ok
+        if direction_int == 1
+            [hit, lvl, src, sw_idx] = f_detect_sweep_long()
+            if hit
+                if show_sweep
+                    label.new(bar_index, lvl, text="⚡SSL " + src,
+                        style=label.style_label_up, size=size.tiny,
+                        color=color.new(color.red, 50), textcolor=color.white)
+                    line.new(sw_idx, lvl, bar_index, lvl,
+                        color=color.new(color.red, 30), style=line.style_dotted, width=1)
+                [d_idx, d_o, d_c, d_h, d_l, _fl, _fh, d_atr_at] = f_disp_long_recent(sw_idx)
+                if d_idx > 0 and d_atr_at > 0
+                    leg = d_h - lvl
+                    if leg > 0
+                        atr_now = atr_v
+                        atr_buf = math.min(stop_atr_buf * atr_now, stop_max_atr * atr_now)
+                        ote_limit = d_h - ote_mid_pct * leg
+                        ote_high  = d_h - ote_low_pct * leg
+                        ote_low   = d_h - ote_high_pct * leg
+                        stop_pr   = lvl - atr_buf
+                        local_eq = (lvl + d_h) / 2
+                        if ote_limit < local_eq
+                            [target_p, target_lbl] = f_find_target_long(ote_limit, stop_pr)
+                            if not na(target_p)
+                                ote.active := true
+                                ote.direction := 1
+                                ote.sweep_idx := sw_idx
+                                ote.disp_idx := d_idx
+                                ote.place_idx := bar_index
+                                ote.expire_idx := bar_index + ote_fill_max_bars
+                                ote.limit_price := ote_limit
+                                ote.stop_price := stop_pr
+                                ote.target_price := target_p
+                                ote.ote_low := ote_low
+                                ote.ote_high := ote_high
+                                ote.sweep_level := lvl
+                                ote.disp_extreme := d_h
+                                ote.bias := "bull"
+                                ote.kz := active_kz
+                                if show_ote
+                                    ote.ote_bx := box.new(bar_index, ote_high, bar_index + ote_fill_max_bars, ote_low,
+                                        border_color = color.new(color.aqua, 30),
+                                        bgcolor = color.new(color.aqua, 90),
+                                        border_width = 1)
+                                    ote.limit_ln := line.new(bar_index, ote_limit, bar_index + ote_fill_max_bars, ote_limit,
+                                        color=color.aqua, style=line.style_solid, width=2)
+                                    ote.stop_ln := line.new(bar_index, stop_pr, bar_index + ote_fill_max_bars, stop_pr,
+                                        color=color.new(color.red, 30), style=line.style_dashed)
+                                    ote.target_ln := line.new(bar_index, target_p, bar_index + ote_fill_max_bars, target_p,
+                                        color=color.new(color.green, 30), style=line.style_dashed)
+                                    ote.info_lb := label.new(bar_index + ote_fill_max_bars, ote_limit,
+                                        text="OTE↑ " + src + "\nE=" + str.tostring(ote_limit, "#.##") +
+                                             "\nS=" + str.tostring(stop_pr, "#.##") +
+                                             "\nT=" + str.tostring(target_p, "#.##") + " (" + target_lbl + ")",
+                                        style=label.style_label_left, size=size.small,
+                                        color=color.new(color.aqua, 60), textcolor=color.white)
+        if direction_int == -1
+            [hit, lvl, src, sw_idx] = f_detect_sweep_short()
+            if hit
+                if show_sweep
+                    label.new(bar_index, lvl, text="⚡BSL " + src,
+                        style=label.style_label_down, size=size.tiny,
+                        color=color.new(color.maroon, 50), textcolor=color.white)
+                    line.new(sw_idx, lvl, bar_index, lvl,
+                        color=color.new(color.maroon, 30), style=line.style_dotted, width=1)
+                [d_idx, d_o, d_c, d_h, d_l, _fl, _fh, d_atr_at] = f_disp_short_recent(sw_idx)
+                if d_idx > 0 and d_atr_at > 0
+                    leg = lvl - d_l
+                    if leg > 0
+                        atr_now = atr_v
+                        atr_buf = math.min(stop_atr_buf * atr_now, stop_max_atr * atr_now)
+                        ote_limit = d_l + ote_mid_pct * leg
+                        ote_high  = d_l + ote_high_pct * leg
+                        ote_low   = d_l + ote_low_pct * leg
+                        stop_pr   = lvl + atr_buf
+                        local_eq = (lvl + d_l) / 2
+                        if ote_limit > local_eq
+                            [target_p, target_lbl] = f_find_target_short(ote_limit, stop_pr)
+                            if not na(target_p)
+                                ote.active := true
+                                ote.direction := -1
+                                ote.sweep_idx := sw_idx
+                                ote.disp_idx := d_idx
+                                ote.place_idx := bar_index
+                                ote.expire_idx := bar_index + ote_fill_max_bars
+                                ote.limit_price := ote_limit
+                                ote.stop_price := stop_pr
+                                ote.target_price := target_p
+                                ote.ote_low := ote_low
+                                ote.ote_high := ote_high
+                                ote.sweep_level := lvl
+                                ote.disp_extreme := d_l
+                                ote.bias := "bear"
+                                ote.kz := active_kz
+                                if show_ote
+                                    ote.ote_bx := box.new(bar_index, ote_high, bar_index + ote_fill_max_bars, ote_low,
+                                        border_color = color.new(color.maroon, 30),
+                                        bgcolor = color.new(color.maroon, 90),
+                                        border_width = 1)
+                                    ote.limit_ln := line.new(bar_index, ote_limit, bar_index + ote_fill_max_bars, ote_limit,
+                                        color=color.maroon, style=line.style_solid, width=2)
+                                    ote.stop_ln := line.new(bar_index, stop_pr, bar_index + ote_fill_max_bars, stop_pr,
+                                        color=color.new(color.red, 30), style=line.style_dashed)
+                                    ote.target_ln := line.new(bar_index, target_p, bar_index + ote_fill_max_bars, target_p,
+                                        color=color.new(color.green, 30), style=line.style_dashed)
+                                    ote.info_lb := label.new(bar_index + ote_fill_max_bars, ote_limit,
+                                        text="OTE↓ " + src + "\nE=" + str.tostring(ote_limit, "#.##") +
+                                             "\nS=" + str.tostring(stop_pr, "#.##") +
+                                             "\nT=" + str.tostring(target_p, "#.##") + " (" + target_lbl + ")",
+                                        style=label.style_label_left, size=size.small,
+                                        color=color.new(color.maroon, 60), textcolor=color.white)
+
+
+// =====================================================================
+// 18. HARD CUTOFF VERTICAL LINE
+// =====================================================================
+prev_past_cutoff = past_hard_cutoff_v[1]
+crossed_cutoff = past_hard_cutoff_v and not prev_past_cutoff
+if show_lunch and crossed_cutoff
+    line.new(bar_index, low - atr_v * 0.5, bar_index, high + atr_v * 0.5,
+        color=color.new(color.red, 30), style=line.style_dashed, width=1, extend=extend.none)
+
+
+// =====================================================================
+// 19. STATUS TABLE (top-right)
+// =====================================================================
+var table tbl = table.new(position.top_right, 2, 8, frame_color=color.gray, frame_width=1)
+if show_status and barstate.islast
+    table.cell(tbl, 0, 0, "ICT v6", text_color=color.white, bgcolor=color.new(color.navy, 30), text_size=size.normal)
+    table.cell(tbl, 1, 0, str.tostring(syminfo.ticker), text_color=color.white, bgcolor=color.new(color.navy, 30), text_size=size.normal)
+    table.cell(tbl, 0, 1, "D1 Bias", text_color=color.silver, bgcolor=color.new(color.black, 60))
+    bias_color = d1_bias == "bull" ? color.new(color.green, 40) : d1_bias == "bear" ? color.new(color.red, 40) : color.new(color.gray, 40)
+    table.cell(tbl, 1, 1, d1_bias, text_color=color.white, bgcolor=bias_color)
+    table.cell(tbl, 0, 2, "Kill Zone", text_color=color.silver, bgcolor=color.new(color.black, 60))
+    table.cell(tbl, 1, 2, active_kz, text_color=color.white, bgcolor=color.new(color.black, 70))
+    table.cell(tbl, 0, 3, "PD pos", text_color=color.silver, bgcolor=color.new(color.black, 60))
+    table.cell(tbl, 1, 3, str.tostring(d1_pd_pos, "#.##"), text_color=color.white, bgcolor=color.new(color.black, 70))
+    table.cell(tbl, 0, 4, "State", text_color=color.silver, bgcolor=color.new(color.black, 60))
+    state_str = tr.active ? "FILLED " + (tr.direction == 1 ? "L" : "S") : ote.active ? "OTE_PEND" : can_arm ? "ARMED" : "IDLE"
+    table.cell(tbl, 1, 4, state_str, text_color=color.white, bgcolor=color.new(color.black, 70))
+    table.cell(tbl, 0, 5, "Trades today", text_color=color.silver, bgcolor=color.new(color.black, 60))
+    table.cell(tbl, 1, 5, str.tostring(trades_today) + "/" + str.tostring(max_per_day), text_color=color.white, bgcolor=color.new(color.black, 70))
+    table.cell(tbl, 0, 6, "Daily R", text_color=color.silver, bgcolor=color.new(color.black, 60))
+    table.cell(tbl, 1, 6, str.tostring(pnl_r_today, "#.##"), text_color=color.white, bgcolor=color.new(color.black, 70))
+    table.cell(tbl, 0, 7, "FVG / OB / EQ", text_color=color.silver, bgcolor=color.new(color.black, 60))
+    table.cell(tbl, 1, 7, str.tostring(fvgs.size()) + " / " + str.tostring(obs.size()) + " / " + str.tostring(eq_clusters.size()), text_color=color.white, bgcolor=color.new(color.black, 70))
+
+
+// =====================================================================
+// 20. DAY-START D1 BIAS LABEL
+// =====================================================================
+if show_d1bias and new_day
+    bias_emoji = d1_bias == "bull" ? "🟢" : d1_bias == "bear" ? "🔴" : "⚪"
+    label.new(bar_index, high + atr_v * 1.2,
+        text=bias_emoji + " D1 " + d1_bias,
+        style=label.style_label_down, size=size.small,
+        color=d1_bias == "bull" ? color.new(color.green, 50) :
+              d1_bias == "bear" ? color.new(color.red, 50) :
+              color.new(color.gray, 50),
+        textcolor=color.white)
+
+
+// =====================================================================
+// END
+// =====================================================================
