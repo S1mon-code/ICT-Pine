@@ -44,7 +44,6 @@ session_h    = input.int(18,   "Session open hour ET (CME)", minval=0, maxval=23
 gap_min_ticks= input.int(4,    "NDOG/NWOG min gap (ticks)",  minval=1, group=g_p)
 right_extend = input.int(50,   "Live right-extend bars",     minval=10, group=g_p)
 dedupe_atr   = input.float(0.3,"Liquidity dedupe (×ATR)",   minval=0.0, group=g_p)
-swept_keep   = input.int(3,    "Swept liquidity history per side", minval=0, group=g_p)
 
 
 // ─── ICT TEMPLATE COLORS (memory feedback_ict_fvg_templates.md) ─────
@@ -57,7 +56,6 @@ COLOR_GAP       = color.rgb(255, 183,  77, 57)   // #ffb74d Material Orange 300
 COLOR_BLACK     = color.rgb(  0,   0,   0,  0)   // black solid
 COLOR_RED       = color.rgb(244,  67,  54,  0)   // #f44336 Material Red 500   (buyside)
 COLOR_BLUE      = color.rgb( 33, 150, 243,  0)   // #2196f3 Material Blue 500  (sellside)
-COLOR_GRAY      = color.rgb(158, 158, 158, 30)   // #9e9e9e Material Gray 500  (swept faded)
 COLOR_TRANS     = color.rgb(255, 255, 255,100)   // fully transparent (border)
 
 
@@ -171,18 +169,14 @@ if barstate.islast and not na(pdl_lb)
 //    • buyside  (swing low)  → red  (#f44336)
 //    • sellside (swing high) → blue (#2196f3)
 //    Lifecycle:
-//      1. New pivot → dedupe vs same-side ACTIVE within `dedupe_atr`×ATR
+//      1. New pivot → dedupe vs same-side within `dedupe_atr`×ATR
 //         (buyside keeps LOWER price; sellside keeps HIGHER price)
-//      2. Sweep detection (high > sellside / low < buyside) → tag swept,
-//         fade to gray dashed
-//      3. Per-side swept history capped at `swept_keep` (FIFO)
+//      2. Sweep (high > sellside / low < buyside) → DELETE immediately
 // =====================================================================
 type Liq
     int   idx
     int   side          // -1 buyside, +1 sellside
     float price
-    bool  swept
-    int   swept_idx
     line  ln
     label lb
 
@@ -203,7 +197,7 @@ f_dedupe_should_skip(int side, float new_price, float thr) =>
         while i < liqs.size()
             l = liqs.get(i)
             advance = true
-            if (not l.swept) and l.side == side and math.abs(l.price - new_price) < thr
+            if l.side == side and math.abs(l.price - new_price) < thr
                 // buyside (-1): keep LOWER. sellside (+1): keep HIGHER.
                 new_is_stronger = (side == -1 and new_price < l.price) or
                                   (side == 1  and new_price > l.price)
@@ -227,7 +221,7 @@ if show_liq_eff and not na(piv_h)
         lb_h = label.new(bar_index + right_extend_eff, piv_h, text = "sellside",
              style = label.style_label_left, color = COLOR_TRANS,
              textcolor = COLOR_BLUE, size = size.normal, textalign = text.align_right)
-        liqs.push(Liq.new(piv_idx_back, 1, piv_h, false, 0, ln_h, lb_h))
+        liqs.push(Liq.new(piv_idx_back, 1, piv_h, ln_h, lb_h))
 
 if show_liq_eff and not na(piv_l)
     if not f_dedupe_should_skip(-1, piv_l, dedupe_thr)
@@ -236,56 +230,24 @@ if show_liq_eff and not na(piv_l)
         lb_l = label.new(bar_index + right_extend_eff, piv_l, text = "buyside",
              style = label.style_label_left, color = COLOR_TRANS,
              textcolor = COLOR_RED, size = size.normal, textalign = text.align_right)
-        liqs.push(Liq.new(piv_idx_back, -1, piv_l, false, 0, ln_l, lb_l))
+        liqs.push(Liq.new(piv_idx_back, -1, piv_l, ln_l, lb_l))
 
-// Sweep detection: tag swept, fade visual to gray-dashed
+// Sweep detection — DELETE on sweep (no faded history per Simon v5)
 if liqs.size() > 0
     i = 0
     while i < liqs.size()
         l = liqs.get(i)
-        if (not l.swept) and ((l.side == 1 and high > l.price) or (l.side == -1 and low < l.price))
-            l.swept := true
-            l.swept_idx := bar_index
+        swept = (l.side == 1 and high > l.price) or (l.side == -1 and low < l.price)
+        if swept
             if not na(l.ln)
-                l.ln.set_color(COLOR_GRAY)
-                l.ln.set_style(line.style_dashed)
+                line.delete(l.ln)
             if not na(l.lb)
-                l.lb.set_textcolor(COLOR_GRAY)
-        i += 1
-
-// Cap swept history per side (FIFO — drop oldest swept once over swept_keep)
-f_cap_swept(int side) =>
-    cnt = 0
-    if liqs.size() > 0
-        for ii = 0 to liqs.size() - 1
-            l = liqs.get(ii)
-            if l.swept and l.side == side
-                cnt += 1
-    while cnt > swept_keep
-        oldest_idx = -1
-        oldest_swept_idx = 99999999
-        if liqs.size() > 0
-            for jj = 0 to liqs.size() - 1
-                l = liqs.get(jj)
-                if l.swept and l.side == side
-                    if l.swept_idx < oldest_swept_idx
-                        oldest_idx := jj
-                        oldest_swept_idx := l.swept_idx
-        if oldest_idx >= 0
-            old = liqs.get(oldest_idx)
-            if not na(old.ln)
-                line.delete(old.ln)
-            if not na(old.lb)
-                label.delete(old.lb)
-            liqs.remove(oldest_idx)
-            cnt -= 1
+                label.delete(l.lb)
+            liqs.remove(i)
         else
-            cnt := 0
+            i += 1
 
-f_cap_swept(1)
-f_cap_swept(-1)
-
-// Hard cap total memory (active + swept) to bound drawing budget
+// Hard cap total memory to bound drawing budget
 while liqs.size() > swing_keep * 2
     l2 = liqs.get(0)
     if not na(l2.ln)
@@ -443,9 +405,12 @@ if obs.size() > 0
                      o.lo, COLOR_BPR, "BPR")
                 o.bx_bpr := bx
                 o.ml_bpr := ml
+        // BPR sweep invalidation — WICK-based per Simon v5 audit:
+        // Bull-orig BPR (now resistance) killed when high pierces top.
+        // Bear-orig BPR (now support)    killed when low  pierces bottom.
         bpr_filled = false
         if o.state == 2
-            if (o.dir == 1 and close > o.hi) or (o.dir == -1 and close < o.lo)
+            if (o.dir == 1 and high > o.hi) or (o.dir == -1 and low < o.lo)
                 bpr_filled := true
         if bpr_filled
             if not na(o.bx_bpr)
