@@ -56,8 +56,26 @@ COLOR_RED       = color.rgb(244,  67,  54,  0)   // #f44336 Material Red 500
 COLOR_TRANS     = color.rgb(255, 255, 255,100)   // fully transparent (border)
 
 
-// ─── Adaptive right-extension by TF (daily/+ caps to keep boxes tight)
-is_higher_tf     = timeframe.in_seconds() >= 86400
+// ─── TF gating per primitive (Simon 2026-05-01 spec) ───────────────
+//   D       : PDH/PDL + NDOG/NWOG
+//   1h      : Liquidity (buyside/sellside, all local extremes)
+//   1h+5m+1m: FVG (bullish/bearish) + BPR
+//   1m      : 1st FVG of session
+tf_secs       = timeframe.in_seconds()
+is_daily      = tf_secs >= 86400
+is_1h_tf      = tf_secs == 3600
+is_5m_tf      = tf_secs == 300
+is_1m_or_less = tf_secs <= 60
+is_intraday_fb = is_1h_tf or is_5m_tf or is_1m_or_less   // FVG/BPR
+
+show_pd_eff    = show_pd        and is_daily
+show_gaps_eff  = show_gaps      and is_daily
+show_liq_eff   = show_liq       and is_1h_tf
+show_fvg_eff   = show_fvg       and is_intraday_fb
+show_bpr_eff   = show_bpr       and is_intraday_fb
+show_first_eff = show_first_fvg and is_1m_or_less
+
+is_higher_tf     = is_daily
 right_extend_eff = is_higher_tf ? math.min(right_extend, 10) : right_extend
 
 
@@ -108,7 +126,7 @@ var label pdl_lb = na
 var float pdh_cached = na
 var float pdl_cached = na
 
-if show_pd and not na(pdh_today) and not na(pdl_today)
+if show_pd_eff and not na(pdh_today) and not na(pdl_today)
     if na(pdh_cached) or pdh_today != pdh_cached or na(pdh_ln)
         if not na(pdh_ln)
             line.delete(pdh_ln)
@@ -142,73 +160,76 @@ if barstate.islast and not na(pdl_lb)
 
 
 // =====================================================================
-// 2. BUYSIDE / SELLSIDE — single most-recent each side. Deleted when
-//    price sweeps through (liquidity taken out).
+// 2. BUYSIDE / SELLSIDE — ALL unswept local extremes (1h TF only).
+//    Each swing pivot becomes a red horizontal line until price sweeps
+//    through, at which point it's deleted (liquidity taken out).
 //    Convention: swing LOW  → buyside  (resting bids)
 //                swing HIGH → sellside (resting offers)
 // =====================================================================
-var line  buy_ln  = na
-var label buy_lb  = na
-var float buy_px  = na
-var line  sell_ln = na
-var label sell_lb = na
-var float sell_px = na
+type Liq
+    int   idx
+    int   side          // -1 buyside (under low), +1 sellside (over high)
+    float price
+    line  ln
+    label lb
+
+var array<Liq> liqs = array.new<Liq>()
 
 piv_h = ta.pivothigh(fractal_n, fractal_n)
 piv_l = ta.pivotlow(fractal_n, fractal_n)
 piv_idx_back = bar_index - fractal_n
 
-if show_liq and not na(piv_h)
-    // Replace prior sellside
-    if not na(sell_ln)
-        line.delete(sell_ln)
-    if not na(sell_lb)
-        label.delete(sell_lb)
-    sell_px := piv_h
-    sell_ln := line.new(piv_idx_back, piv_h, bar_index + right_extend_eff, piv_h,
+if show_liq_eff and not na(piv_h)
+    ln_h = line.new(piv_idx_back, piv_h, bar_index + right_extend_eff, piv_h,
          color = COLOR_RED, width = 2, extend = extend.right)
-    sell_lb := label.new(bar_index + right_extend_eff, piv_h, text = "sellside",
+    lb_h = label.new(bar_index + right_extend_eff, piv_h, text = "sellside",
          style = label.style_label_left, color = COLOR_TRANS,
-         textcolor = COLOR_RED, size = size.normal,
-         textalign = text.align_right)
+         textcolor = COLOR_RED, size = size.normal, textalign = text.align_right)
+    liqs.push(Liq.new(piv_idx_back, 1, piv_h, ln_h, lb_h))
 
-if show_liq and not na(piv_l)
-    if not na(buy_ln)
-        line.delete(buy_ln)
-    if not na(buy_lb)
-        label.delete(buy_lb)
-    buy_px := piv_l
-    buy_ln := line.new(piv_idx_back, piv_l, bar_index + right_extend_eff, piv_l,
+if show_liq_eff and not na(piv_l)
+    ln_l = line.new(piv_idx_back, piv_l, bar_index + right_extend_eff, piv_l,
          color = COLOR_RED, width = 2, extend = extend.right)
-    buy_lb := label.new(bar_index + right_extend_eff, piv_l, text = "buyside",
+    lb_l = label.new(bar_index + right_extend_eff, piv_l, text = "buyside",
          style = label.style_label_left, color = COLOR_TRANS,
-         textcolor = COLOR_RED, size = size.normal,
-         textalign = text.align_right)
+         textcolor = COLOR_RED, size = size.normal, textalign = text.align_right)
+    liqs.push(Liq.new(piv_idx_back, -1, piv_l, ln_l, lb_l))
 
-// Sweep detection: high pierces sellside → taken; low pierces buyside → taken
-if not na(sell_px) and high > sell_px
-    if not na(sell_ln)
-        line.delete(sell_ln)
-    if not na(sell_lb)
-        label.delete(sell_lb)
-    sell_ln := na
-    sell_lb := na
-    sell_px := na
-if not na(buy_px) and low < buy_px
-    if not na(buy_ln)
-        line.delete(buy_ln)
-    if not na(buy_lb)
-        label.delete(buy_lb)
-    buy_ln := na
-    buy_lb := na
-    buy_px := na
+// Sweep detection: iterate, delete those whose level was pierced.
+// Sellside (side=+1): high > price ⇒ swept (price reached above swing high)
+// Buyside  (side=-1): low  < price ⇒ swept (price reached below swing low)
+if liqs.size() > 0
+    i = 0
+    while i < liqs.size()
+        l = liqs.get(i)
+        swept = (l.side == 1 and high > l.price) or (l.side == -1 and low < l.price)
+        if swept
+            if not na(l.ln)
+                line.delete(l.ln)
+            if not na(l.lb)
+                label.delete(l.lb)
+            liqs.remove(i)
+        else
+            i += 1
 
-// Keep label x riding with latest bar
-if barstate.islast
-    if not na(sell_lb)
-        sell_lb.set_x(bar_index + right_extend_eff)
-    if not na(buy_lb)
-        buy_lb.set_x(bar_index + right_extend_eff)
+// Hard-cap memory by oldest-out per side (avoids 500-line budget overflow)
+if liqs.size() > swing_keep * 2
+    j = 0
+    while j < liqs.size() and liqs.size() > swing_keep * 2
+        l = liqs.get(j)
+        // Drop oldest regardless of side; lines are insert-order so this trims tail
+        if not na(l.ln)
+            line.delete(l.ln)
+        if not na(l.lb)
+            label.delete(l.lb)
+        liqs.remove(j)
+
+// Keep label x riding with latest bar (only every-bar update is fine)
+if barstate.islast and liqs.size() > 0
+    for k = 0 to liqs.size() - 1
+        liq_cur = liqs.get(k)
+        if not na(liq_cur.lb)
+            liq_cur.lb.set_x(bar_index + right_extend_eff)
 
 
 // =====================================================================
@@ -239,12 +260,12 @@ if new_session
 
 is_1m = timeframe.in_seconds() <= 60
 
-if show_fvg and barstate.isconfirmed and bar_index >= 2 and not na(atr_v) and atr_v > 0
+if show_fvg_eff and barstate.isconfirmed and bar_index >= 2 and not na(atr_v) and atr_v > 0
     // Bullish FVG: low[0] > high[2]
     if low > high[2]
         sz = low - high[2]
         if sz >= fvg_min_atr * atr_v
-            is_first = show_first_fvg and is_1m and not first_fvg_drawn
+            is_first = show_first_eff and is_1m and not first_fvg_drawn
             fill_color = is_first ? COLOR_FIRST_FVG : COLOR_BULL_FVG
             txt = is_first ? "1st fvg" : "bullish fvg"
             [bx, ml] = f_make_rect(bar_index - 2, low, bar_index + right_extend_eff,
@@ -258,7 +279,7 @@ if show_fvg and barstate.isconfirmed and bar_index >= 2 and not na(atr_v) and at
     if high < low[2]
         sz = low[2] - high
         if sz >= fvg_min_atr * atr_v
-            is_first = show_first_fvg and is_1m and not first_fvg_drawn
+            is_first = show_first_eff and is_1m and not first_fvg_drawn
             fill_color = is_first ? COLOR_FIRST_FVG : COLOR_BEAR_FVG
             txt = is_first ? "1st fvg" : "bearish fvg"
             [bx, ml] = f_make_rect(bar_index - 2, low[2], bar_index + right_extend_eff,
@@ -314,7 +335,7 @@ type OBI
 
 var array<OBI> obs = array.new<OBI>()
 
-if barstate.isconfirmed and bar_index >= 4 and not na(atr_v) and atr_v > 0
+if show_bpr_eff and barstate.isconfirmed and bar_index >= 4 and not na(atr_v) and atr_v > 0
     ob_idx     = bar_index - 1
     disp_body  = math.abs(close - open)
     ob_body    = math.abs(close[1] - open[1])
@@ -353,7 +374,7 @@ if obs.size() > 0
             if o.dir == -1 and close > o.hi
                 o.state := 2
                 promoted := true
-            if promoted and show_bpr
+            if promoted and show_bpr_eff
                 [bx, ml] = f_make_rect(o.idx, o.hi, bar_index + right_extend_eff,
                      o.lo, COLOR_BPR, "BPR")
                 o.bx_bpr := bx
@@ -404,7 +425,7 @@ new_gap_hi = na
 new_gap_kind = ""
 new_gap_left = bar_index
 
-if show_gaps and is_session_intra and not na(prev_session_close) and not na(atr_v)
+if show_gaps_eff and is_session_intra and not na(prev_session_close) and not na(atr_v)
     diff = close - prev_session_close
     if math.abs(diff) > math.max(syminfo.mintick * gap_min_ticks, atr_v * 0.5)
         new_gap_lo := math.min(prev_session_close, close)
@@ -412,7 +433,7 @@ if show_gaps and is_session_intra and not na(prev_session_close) and not na(atr_
         new_gap_kind := (et_dow == dayofweek.sunday or et_dow == dayofweek.monday) ? "NWOG" : "NDOG"
         new_gap_left := bar_index
 
-if show_gaps and is_real_daily_gap
+if show_gaps_eff and is_real_daily_gap
     pc = close[1]
     new_gap_lo := math.min(pc, open)
     new_gap_hi := math.max(pc, open)
