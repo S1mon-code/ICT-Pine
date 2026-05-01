@@ -1,13 +1,14 @@
 //@version=6
 // =====================================================================
 // ICT Annotator (Simon's templates) — pure visualization indicator
-// Annotates 7 primitives in Simon's exact RGBA + label conventions:
-//   • PDH / PDL              — black line + black text
-//   • buyside / sellside     — red line + red text (swing pivots)
+// Annotates 8 primitives in Simon's exact RGBA + label conventions:
+//   • PDH / PDL              — black line + black text (cross-TF)
+//   • buyside                 — red line + red text (swing low, 1h)
+//   • sellside                — blue line + blue text (swing high, 1h)
 //   • Bullish / Bearish FVG  — green / coral rectangles
 //   • BPR                    — purple rectangle (broken OB flipped role)
 //   • 1st FVG (1min only)    — cyan rectangle, first FVG of session
-//   • NDOG / NWOG            — orange rectangle (daily session gap)
+//   • NDOG / NWOG            — orange rectangle (daily session gap, cross-TF)
 //
 // Templates locked to memory feedback_ict_fvg_templates.md.
 // All rectangles: alpha 0.4268 fill, transparent border, black middle
@@ -34,7 +35,7 @@ show_mid       = input.bool(true,  "Box middle line",           group=g_t)
 g_p          = "▼ Params"
 fractal_n    = input.int(3,    "Fractal N (swing pivot)", minval=2, group=g_p)
 atr_len      = input.int(14,   "ATR length",                       group=g_p)
-disp_atr     = input.float(1.0,"Displacement N×ATR",               group=g_p)
+disp_atr     = input.float(1.5,"Displacement N×ATR (BPR strictness)", group=g_p)
 fvg_min_atr  = input.float(0.2,"FVG min N×ATR",                    group=g_p)
 fvg_max_age  = input.int(480,  "FVG max age (bars)",               group=g_p)
 ob_max_age   = input.int(1440, "OB max age (bars)",                group=g_p)
@@ -42,6 +43,8 @@ swing_keep   = input.int(40,   "Swings kept per side",             group=g_p)
 session_h    = input.int(18,   "Session open hour ET (CME)", minval=0, maxval=23, group=g_p)
 gap_min_ticks= input.int(4,    "NDOG/NWOG min gap (ticks)",  minval=1, group=g_p)
 right_extend = input.int(50,   "Live right-extend bars",     minval=10, group=g_p)
+dedupe_atr   = input.float(0.3,"Liquidity dedupe (×ATR)",   minval=0.0, group=g_p)
+swept_keep   = input.int(3,    "Swept liquidity history per side", minval=0, group=g_p)
 
 
 // ─── ICT TEMPLATE COLORS (memory feedback_ict_fvg_templates.md) ─────
@@ -52,15 +55,19 @@ COLOR_BPR       = color.rgb(156,  39, 176, 57)   // #9c27b0 Material Purple 500
 COLOR_FIRST_FVG = color.rgb( 38, 198, 218, 57)   // #26c6da Material Cyan 400
 COLOR_GAP       = color.rgb(255, 183,  77, 57)   // #ffb74d Material Orange 300
 COLOR_BLACK     = color.rgb(  0,   0,   0,  0)   // black solid
-COLOR_RED       = color.rgb(244,  67,  54,  0)   // #f44336 Material Red 500
+COLOR_RED       = color.rgb(244,  67,  54,  0)   // #f44336 Material Red 500   (buyside)
+COLOR_BLUE      = color.rgb( 33, 150, 243,  0)   // #2196f3 Material Blue 500  (sellside)
+COLOR_GRAY      = color.rgb(158, 158, 158, 30)   // #9e9e9e Material Gray 500  (swept faded)
 COLOR_TRANS     = color.rgb(255, 255, 255,100)   // fully transparent (border)
 
 
 // ─── TF gating per primitive (Simon 2026-05-01 spec) ───────────────
-//   D       : PDH/PDL + NDOG/NWOG
-//   1h      : Liquidity (buyside/sellside, all local extremes)
-//   1h+5m+1m: FVG (bullish/bearish) + BPR
-//   1m      : 1st FVG of session
+//   Detection TF (where we DETECT)        | Display TF (where we SHOW)
+//   ─────────────────────────────────────  | ──────────────────────────
+//   D       : PDH/PDL + NDOG/NWOG          | ALL TFs (cross-TF via request.security)
+//   1h      : Liquidity buyside/sellside   | 1h only
+//   1h+5m+1m: FVG (bullish/bearish) + BPR  | native TF
+//   1m      : 1st FVG of session           | 1m only
 tf_secs       = timeframe.in_seconds()
 is_daily      = tf_secs >= 86400
 is_1h_tf      = tf_secs == 3600
@@ -68,8 +75,8 @@ is_5m_tf      = tf_secs == 300
 is_1m_or_less = tf_secs <= 60
 is_intraday_fb = is_1h_tf or is_5m_tf or is_1m_or_less   // FVG/BPR
 
-show_pd_eff    = show_pd        and is_daily
-show_gaps_eff  = show_gaps      and is_daily
+show_pd_eff    = show_pd                                     // ALL TFs
+show_gaps_eff  = show_gaps                                   // ALL TFs (cross-TF detection below)
 show_liq_eff   = show_liq       and is_1h_tf
 show_fvg_eff   = show_fvg       and is_intraday_fb
 show_bpr_eff   = show_bpr       and is_intraday_fb
@@ -114,7 +121,7 @@ f_make_rect(int x_left, float y_top, int x_right, float y_bot, color fill, strin
 
 
 // =====================================================================
-// 1. PDH / PDL — black horizontal lines, redrawn each new day
+// 1. PDH / PDL — black horizontal lines (CROSS-TF: shown on every TF)
 // =====================================================================
 [pdh_today, pdl_today] = request.security(syminfo.tickerid, "D",
      [high[1], low[1]], lookahead = barmerge.lookahead_off)
@@ -161,15 +168,21 @@ if barstate.islast and not na(pdl_lb)
 
 // =====================================================================
 // 2. BUYSIDE / SELLSIDE — ALL unswept local extremes (1h TF only).
-//    Each swing pivot becomes a red horizontal line until price sweeps
-//    through, at which point it's deleted (liquidity taken out).
-//    Convention: swing LOW  → buyside  (resting bids)
-//                swing HIGH → sellside (resting offers)
+//    • buyside  (swing low)  → red  (#f44336)
+//    • sellside (swing high) → blue (#2196f3)
+//    Lifecycle:
+//      1. New pivot → dedupe vs same-side ACTIVE within `dedupe_atr`×ATR
+//         (buyside keeps LOWER price; sellside keeps HIGHER price)
+//      2. Sweep detection (high > sellside / low < buyside) → tag swept,
+//         fade to gray dashed
+//      3. Per-side swept history capped at `swept_keep` (FIFO)
 // =====================================================================
 type Liq
     int   idx
-    int   side          // -1 buyside (under low), +1 sellside (over high)
+    int   side          // -1 buyside, +1 sellside
     float price
+    bool  swept
+    int   swept_idx
     line  ln
     label lb
 
@@ -179,52 +192,109 @@ piv_h = ta.pivothigh(fractal_n, fractal_n)
 piv_l = ta.pivotlow(fractal_n, fractal_n)
 piv_idx_back = bar_index - fractal_n
 
+dedupe_thr = na(atr_v) ? 0.0 : atr_v * dedupe_atr
+
+// Returns true if a near-by ACTIVE same-side level dominates (skip new).
+// Otherwise, deletes any near-by dominated levels and returns false.
+f_dedupe_should_skip(int side, float new_price, float thr) =>
+    skip = false
+    if liqs.size() > 0
+        i = 0
+        while i < liqs.size()
+            l = liqs.get(i)
+            advance = true
+            if (not l.swept) and l.side == side and math.abs(l.price - new_price) < thr
+                // buyside (-1): keep LOWER. sellside (+1): keep HIGHER.
+                new_is_stronger = (side == -1 and new_price < l.price) or
+                                  (side == 1  and new_price > l.price)
+                if new_is_stronger
+                    if not na(l.ln)
+                        line.delete(l.ln)
+                    if not na(l.lb)
+                        label.delete(l.lb)
+                    liqs.remove(i)
+                    advance := false
+                else
+                    skip := true
+            if advance
+                i += 1
+    skip
+
 if show_liq_eff and not na(piv_h)
-    ln_h = line.new(piv_idx_back, piv_h, bar_index + right_extend_eff, piv_h,
-         color = COLOR_RED, width = 2, extend = extend.right)
-    lb_h = label.new(bar_index + right_extend_eff, piv_h, text = "sellside",
-         style = label.style_label_left, color = COLOR_TRANS,
-         textcolor = COLOR_RED, size = size.normal, textalign = text.align_right)
-    liqs.push(Liq.new(piv_idx_back, 1, piv_h, ln_h, lb_h))
+    if not f_dedupe_should_skip(1, piv_h, dedupe_thr)
+        ln_h = line.new(piv_idx_back, piv_h, bar_index + right_extend_eff, piv_h,
+             color = COLOR_BLUE, width = 2, extend = extend.right)
+        lb_h = label.new(bar_index + right_extend_eff, piv_h, text = "sellside",
+             style = label.style_label_left, color = COLOR_TRANS,
+             textcolor = COLOR_BLUE, size = size.normal, textalign = text.align_right)
+        liqs.push(Liq.new(piv_idx_back, 1, piv_h, false, 0, ln_h, lb_h))
 
 if show_liq_eff and not na(piv_l)
-    ln_l = line.new(piv_idx_back, piv_l, bar_index + right_extend_eff, piv_l,
-         color = COLOR_RED, width = 2, extend = extend.right)
-    lb_l = label.new(bar_index + right_extend_eff, piv_l, text = "buyside",
-         style = label.style_label_left, color = COLOR_TRANS,
-         textcolor = COLOR_RED, size = size.normal, textalign = text.align_right)
-    liqs.push(Liq.new(piv_idx_back, -1, piv_l, ln_l, lb_l))
+    if not f_dedupe_should_skip(-1, piv_l, dedupe_thr)
+        ln_l = line.new(piv_idx_back, piv_l, bar_index + right_extend_eff, piv_l,
+             color = COLOR_RED, width = 2, extend = extend.right)
+        lb_l = label.new(bar_index + right_extend_eff, piv_l, text = "buyside",
+             style = label.style_label_left, color = COLOR_TRANS,
+             textcolor = COLOR_RED, size = size.normal, textalign = text.align_right)
+        liqs.push(Liq.new(piv_idx_back, -1, piv_l, false, 0, ln_l, lb_l))
 
-// Sweep detection: iterate, delete those whose level was pierced.
-// Sellside (side=+1): high > price ⇒ swept (price reached above swing high)
-// Buyside  (side=-1): low  < price ⇒ swept (price reached below swing low)
+// Sweep detection: tag swept, fade visual to gray-dashed
 if liqs.size() > 0
     i = 0
     while i < liqs.size()
         l = liqs.get(i)
-        swept = (l.side == 1 and high > l.price) or (l.side == -1 and low < l.price)
-        if swept
+        if (not l.swept) and ((l.side == 1 and high > l.price) or (l.side == -1 and low < l.price))
+            l.swept := true
+            l.swept_idx := bar_index
             if not na(l.ln)
-                line.delete(l.ln)
+                l.ln.set_color(COLOR_GRAY)
+                l.ln.set_style(line.style_dashed)
             if not na(l.lb)
-                label.delete(l.lb)
-            liqs.remove(i)
+                l.lb.set_textcolor(COLOR_GRAY)
+        i += 1
+
+// Cap swept history per side (FIFO — drop oldest swept once over swept_keep)
+f_cap_swept(int side) =>
+    cnt = 0
+    if liqs.size() > 0
+        for ii = 0 to liqs.size() - 1
+            l = liqs.get(ii)
+            if l.swept and l.side == side
+                cnt += 1
+    while cnt > swept_keep
+        oldest_idx = -1
+        oldest_swept_idx = 99999999
+        if liqs.size() > 0
+            for jj = 0 to liqs.size() - 1
+                l = liqs.get(jj)
+                if l.swept and l.side == side
+                    if l.swept_idx < oldest_swept_idx
+                        oldest_idx := jj
+                        oldest_swept_idx := l.swept_idx
+        if oldest_idx >= 0
+            old = liqs.get(oldest_idx)
+            if not na(old.ln)
+                line.delete(old.ln)
+            if not na(old.lb)
+                label.delete(old.lb)
+            liqs.remove(oldest_idx)
+            cnt -= 1
         else
-            i += 1
+            cnt := 0
 
-// Hard-cap memory by oldest-out per side (avoids 500-line budget overflow)
-if liqs.size() > swing_keep * 2
-    j = 0
-    while j < liqs.size() and liqs.size() > swing_keep * 2
-        l = liqs.get(j)
-        // Drop oldest regardless of side; lines are insert-order so this trims tail
-        if not na(l.ln)
-            line.delete(l.ln)
-        if not na(l.lb)
-            label.delete(l.lb)
-        liqs.remove(j)
+f_cap_swept(1)
+f_cap_swept(-1)
 
-// Keep label x riding with latest bar (only every-bar update is fine)
+// Hard cap total memory (active + swept) to bound drawing budget
+while liqs.size() > swing_keep * 2
+    l2 = liqs.get(0)
+    if not na(l2.ln)
+        line.delete(l2.ln)
+    if not na(l2.lb)
+        label.delete(l2.lb)
+    liqs.remove(0)
+
+// Live label/line right-extension
 if barstate.islast and liqs.size() > 0
     for k = 0 to liqs.size() - 1
         liq_cur = liqs.get(k)
@@ -248,8 +318,7 @@ type FVG
 
 var array<FVG> fvgs = array.new<FVG>()
 
-// Session-open detector (CME globex resume at session_h ET intraday;
-// every bar on D+ TF). Used to reset 1st-FVG flag.
+// Session-open detector (CME globex resume at session_h ET intraday)
 session_open_intraday = timeframe.isintraday and et_h == session_h and et_h[1] != session_h
 session_open_daily    = timeframe.isdaily and bar_index >= 1
 new_session = session_open_intraday or session_open_daily
@@ -290,8 +359,6 @@ if show_fvg_eff and barstate.isconfirmed and bar_index >= 2 and not na(atr_v) an
                 first_fvg_drawn := true
 
 // FVG lifecycle: extend right while open; DELETE immediately on full fill.
-// Bullish FVG fully filled when price's low closes/wicks to f.lo (lower edge).
-// Bearish FVG fully filled when price's high closes/wicks to f.hi (upper edge).
 if fvgs.size() > 0
     i = 0
     while i < fvgs.size()
@@ -322,7 +389,8 @@ if fvgs.size() > 0
 // =====================================================================
 // 4. BPR — emit only when an OB is broken (state flips). Internal OB
 //    detection mirrors ICT_v6_lite.pine but never visualizes the
-//    pre-break OB; only the BPR purple rectangle on flip.
+//    pre-break OB; only the BPR purple rectangle on flip. Stricter
+//    `disp_atr` default (1.5) reduces false positives.
 // =====================================================================
 type OBI
     int   idx
@@ -352,11 +420,7 @@ if show_bpr_eff and barstate.isconfirmed and bar_index >= 4 and not na(atr_v) an
     if is_ob_bull and is_disp_bear and (body_ratio >= 0.3 or ob_body >= 0.3 * atr_v)
         obs.push(OBI.new(ob_idx, -1, ob_l, ob_h, 0, na, na))
 
-// Promotion to BPR + lifecycle. Once promoted (state=2), BPR is "fully
-// filled / taken out" when price closes back through the OPPOSITE side
-// (original-bull OB→BPR is invalidated when close > o.hi, i.e. price
-// reclaims above the broken zone; original-bear OB→BPR invalidated when
-// close < o.lo). Filled BPR is DELETED, not dimmed.
+// Promotion to BPR + lifecycle. Filled BPR is DELETED, not dimmed.
 if obs.size() > 0
     i = 0
     while i < obs.size()
@@ -379,7 +443,6 @@ if obs.size() > 0
                      o.lo, COLOR_BPR, "BPR")
                 o.bx_bpr := bx
                 o.ml_bpr := ml
-        // BPR fill detection (state==2): close returns through the BPR
         bpr_filled = false
         if o.state == 2
             if (o.dir == 1 and close > o.hi) or (o.dir == -1 and close < o.lo)
@@ -406,47 +469,36 @@ if obs.size() > 0
 
 
 // =====================================================================
-// 5. NDOG / NWOG — single most-recent gap. New gap replaces the prior.
-//    Real-gap detection on D+ TF: today's open outside prior bar's H/L.
-//    Intraday: at session_h:00 ET roll with ATR-scaled threshold.
+// 5. NDOG / NWOG — single most-recent gap (CROSS-TF: detected via
+//    request.security from D, displayed on every TF). Real gap = today's
+//    open is OUTSIDE yesterday's H/L range.
 // =====================================================================
+[d_open, d_h_y, d_l_y, d_c_y] = request.security(syminfo.tickerid, "D",
+     [open, high[1], low[1], close[1]],
+     lookahead = barmerge.lookahead_off)
+
 var int   gap_idx  = na
 var float gap_lo   = na
 var float gap_hi   = na
 var box   gap_bx   = na
 var line  gap_ml   = na
-var float prev_session_close = na
+var float prev_d_open = na
 
-is_real_daily_gap = is_higher_tf and bar_index >= 1 and (open > high[1] or open < low[1])
-is_session_intra  = timeframe.isintraday and et_h == session_h and et_h[1] != session_h and barstate.isconfirmed
+// Detect a NEW daily-gap event from the cross-TF series. Fire on the bar
+// where the daily series rolls (first bar of the new daily session on
+// intraday, or the new daily bar itself on D).
+new_d = not na(d_open) and (na(prev_d_open) or d_open != prev_d_open)
+real_d_gap = new_d and not na(d_h_y) and not na(d_l_y) and (d_open > d_h_y or d_open < d_l_y)
 
-new_gap_lo = na
-new_gap_hi = na
-new_gap_kind = ""
-new_gap_left = bar_index
-
-if show_gaps_eff and is_session_intra and not na(prev_session_close) and not na(atr_v)
-    diff = close - prev_session_close
-    if math.abs(diff) > math.max(syminfo.mintick * gap_min_ticks, atr_v * 0.5)
-        new_gap_lo := math.min(prev_session_close, close)
-        new_gap_hi := math.max(prev_session_close, close)
-        new_gap_kind := (et_dow == dayofweek.sunday or et_dow == dayofweek.monday) ? "NWOG" : "NDOG"
-        new_gap_left := bar_index
-
-if show_gaps_eff and is_real_daily_gap
-    pc = close[1]
-    new_gap_lo := math.min(pc, open)
-    new_gap_hi := math.max(pc, open)
-    new_gap_kind := (et_dow == dayofweek.sunday or et_dow == dayofweek.monday) ? "NWOG" : "NDOG"
-    new_gap_left := bar_index - 1
-
-if not na(new_gap_lo)
-    // Replace prior gap (only most-recent kept)
+if show_gaps_eff and real_d_gap
     if not na(gap_bx)
         box.delete(gap_bx)
     if not na(gap_ml)
         line.delete(gap_ml)
-    [bx, ml] = f_make_rect(new_gap_left, new_gap_hi, bar_index + right_extend_eff,
+    new_gap_lo = math.min(d_c_y, d_open)
+    new_gap_hi = math.max(d_c_y, d_open)
+    new_gap_kind = (et_dow == dayofweek.sunday or et_dow == dayofweek.monday) ? "NWOG" : "NDOG"
+    [bx, ml] = f_make_rect(bar_index, new_gap_hi, bar_index + right_extend_eff,
          new_gap_lo, COLOR_GAP, new_gap_kind)
     gap_bx  := bx
     gap_ml  := ml
@@ -454,11 +506,10 @@ if not na(new_gap_lo)
     gap_lo  := new_gap_lo
     gap_hi  := new_gap_hi
 
-// Update prev_session_close only at intraday session boundary
-if timeframe.isintraday and et_h == session_h and et_h[1] != session_h
-    prev_session_close := close[1]
+if new_d and not na(d_open)
+    prev_d_open := d_open
 
-// Gap fill: any bar enters the zone → DELETE (gap consumed, single most-recent)
+// Gap fill: any bar enters the zone → DELETE
 if not na(gap_lo) and bar_index > nz(gap_idx) and (low <= gap_lo or high >= gap_hi)
     if not na(gap_bx)
         box.delete(gap_bx)
